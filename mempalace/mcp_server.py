@@ -399,11 +399,26 @@ def _ensure_wal() -> None:
     the documented kill switch in hooks_cli._palace_root_exists() relies on
     that directory being absent when the user has explicitly removed it.
     See MemPalace issue #1676.
+
+    Failures here (e.g. read-only $HOME, permission errors) are swallowed
+    rather than propagated: the previous module-level setup also tolerated
+    chmod / file-open failures silently, and the caller (_wal_log) has its
+    own try/except that is intended to log and continue on WAL errors.
+    Letting mkdir raise out of _ensure_wal would bypass that contract and
+    break the actual write operation, which is a regression vs. pre-#1676
+    behavior.
     """
     global _wal_initialized
     if _wal_initialized:
         return
-    _WAL_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        _WAL_DIR.mkdir(parents=True, exist_ok=True)
+    except (OSError, NotImplementedError):
+        # Without the WAL dir, the file open below will also fail; both are
+        # tolerated and _wal_log's outer try/except will record the write
+        # as best-effort. Mark initialized so we don't retry on every write.
+        _wal_initialized = True
+        return
     try:
         _WAL_DIR.chmod(0o700)
     except (OSError, NotImplementedError):

@@ -3221,11 +3221,10 @@ def test_mcp_server_import_does_not_create_palace_root(tmp_path):
     mkdir defeats this contract: importing the MCP server would unconditionally
     recreate the palace root, silently re-enabling hooks the user had disabled.
 
-    This test runs in a subprocess with HOME pointed at an empty temp directory
-    so that conftest.py's session-wide HOME redirect does not mask the bug or
-    the fix.  The subprocess imports mempalace.mcp_server and then reports
-    whether ~/.mempalace exists.  If the bug is present the directory will be
-    there; with the lazy-init fix it must remain absent.
+    Runs in a subprocess with HOME set via the subprocess env (set before any
+    interpreter startup so module-level os.path.expanduser sees it) and a
+    timeout to prevent a hang from stalling the suite. Mirrors the pattern
+    used by test_lazy_init_no_import_side_effect for the KG cache.
 
     Note: mcp_server.py redirects sys.stdout → sys.stderr at import time (for
     clean JSON-RPC stdio multiplexing; see the comment near line 27 and
@@ -3234,17 +3233,21 @@ def test_mcp_server_import_does_not_create_palace_root(tmp_path):
     """
     code = (
         "import os, sys\n"
-        f"os.environ['HOME'] = {str(tmp_path)!r}\n"
         "import mempalace.mcp_server  # noqa: F401\n"
         f"palace_root = os.path.join({str(tmp_path)!r}, '.mempalace')\n"
         # mcp_server redirects sys.stdout → sys.stderr at import time, so
         # write to the *real* stderr (sys.__stderr__) to avoid ambiguity.
         "sys.__stderr__.write('EXISTS:' + str(os.path.exists(palace_root)) + '\\n')\n"
     )
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MEMPAL")}
+    env["HOME"] = str(tmp_path)
+    env["USERPROFILE"] = str(tmp_path)
     result = subprocess.run(
         [sys.executable, "-c", code],
+        env=env,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     assert result.returncode == 0, (
         f"subprocess failed (exit {result.returncode}):\n"
