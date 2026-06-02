@@ -3208,3 +3208,50 @@ class TestUnknownParamName:
         )
         assert "error" not in resp
         assert "result" in resp
+
+
+# ── Kill-switch regression: import must not create ~/.mempalace ──────────────
+
+
+def test_mcp_server_import_does_not_create_palace_root(tmp_path):
+    """MemPalace#1676: importing mcp_server must not create ~/.mempalace/.
+
+    The kill switch in hooks_cli._palace_root_exists() relies on the palace
+    root being absent when the user has explicitly removed it.  A module-level
+    mkdir defeats this contract: importing the MCP server would unconditionally
+    recreate the palace root, silently re-enabling hooks the user had disabled.
+
+    This test runs in a subprocess with HOME pointed at an empty temp directory
+    so that conftest.py's session-wide HOME redirect does not mask the bug or
+    the fix.  The subprocess imports mempalace.mcp_server and then reports
+    whether ~/.mempalace exists.  If the bug is present the directory will be
+    there; with the lazy-init fix it must remain absent.
+
+    Note: mcp_server.py redirects sys.stdout → sys.stderr at import time (for
+    clean JSON-RPC stdio multiplexing; see the comment near line 27 and
+    the _restore_stdout() call in main()).  The probe therefore writes to
+    stderr so it is not swallowed by that redirect.
+    """
+    code = (
+        "import os, sys\n"
+        f"os.environ['HOME'] = {str(tmp_path)!r}\n"
+        "import mempalace.mcp_server  # noqa: F401\n"
+        f"palace_root = os.path.join({str(tmp_path)!r}, '.mempalace')\n"
+        # mcp_server redirects sys.stdout → sys.stderr at import time, so
+        # write to the *real* stderr (sys.__stderr__) to avoid ambiguity.
+        "sys.__stderr__.write('EXISTS:' + str(os.path.exists(palace_root)) + '\\n')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"subprocess failed (exit {result.returncode}):\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "EXISTS:False" in result.stderr, (
+        "mcp_server import created ~/.mempalace/ as a side effect, "
+        "defeating the hooks_cli._palace_root_exists() kill switch (#1676).\n"
+        f"subprocess stderr: {result.stderr!r}"
+    )

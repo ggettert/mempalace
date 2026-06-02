@@ -388,20 +388,36 @@ def _refresh_vector_disabled_flag() -> None:
 # enables review/rollback of writes from external or untrusted sources.
 
 _WAL_DIR = Path(os.path.expanduser("~/.mempalace/wal"))
-_WAL_DIR.mkdir(parents=True, exist_ok=True)
-try:
-    _WAL_DIR.chmod(0o700)
-except (OSError, NotImplementedError):
-    pass
 _WAL_FILE = _WAL_DIR / "write_log.jsonl"
-# Atomically create WAL file with restricted permissions (no TOCTOU race).
-# os.open with O_CREAT|O_WRONLY and mode 0o600 creates the file if absent
-# or opens it if present, both in a single syscall.
-try:
-    _fd = os.open(str(_WAL_FILE), os.O_CREAT | os.O_WRONLY, 0o600)
-    os.close(_fd)
-except (OSError, NotImplementedError):
-    pass
+_wal_initialized = False
+
+
+def _ensure_wal() -> None:
+    """Initialize WAL directory and file on first use.
+
+    Module import must not create ~/.mempalace/ as a side effect, because
+    the documented kill switch in hooks_cli._palace_root_exists() relies on
+    that directory being absent when the user has explicitly removed it.
+    See MemPalace issue #1676.
+    """
+    global _wal_initialized
+    if _wal_initialized:
+        return
+    _WAL_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        _WAL_DIR.chmod(0o700)
+    except (OSError, NotImplementedError):
+        pass
+    # Atomically create WAL file with restricted permissions (no TOCTOU race).
+    # os.open with O_CREAT|O_WRONLY and mode 0o600 creates the file if absent
+    # or opens it if present, both in a single syscall.
+    try:
+        _fd = os.open(str(_WAL_FILE), os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(_fd)
+    except (OSError, NotImplementedError):
+        pass
+    _wal_initialized = True
+
 
 # Keys whose values should be redacted in WAL entries to avoid logging sensitive content
 _WAL_REDACT_KEYS = frozenset(
@@ -411,6 +427,7 @@ _WAL_REDACT_KEYS = frozenset(
 
 def _wal_log(operation: str, params: dict, result: dict = None):
     """Append a write operation to the write-ahead log."""
+    _ensure_wal()
     # Redact sensitive content from params before logging
     safe_params = {}
     for k, v in params.items():
