@@ -28,11 +28,15 @@ from .base import (
     RouteHint,
     SchemaConformanceError,
     SourceAdapterError,
+    SourceAdapterProtocolError,
     SourceItemMetadata,
     SourceNotFoundError,
     SourceRef,
     SourceSummary,
     TransformationViolationError,
+    UnknownSourceAdapterError,
+    validate_adapter_schema,
+    validate_drawer_metadata,
 )
 from .context import PalaceContext, ProgressHook
 from .registry import (
@@ -59,11 +63,13 @@ __all__ = [
     "RouteHint",
     "SchemaConformanceError",
     "SourceAdapterError",
+    "SourceAdapterProtocolError",
     "SourceItemMetadata",
     "SourceNotFoundError",
     "SourceRef",
     "SourceSummary",
     "TransformationViolationError",
+    "UnknownSourceAdapterError",
     "available_adapters",
     "get_adapter",
     "get_adapter_class",
@@ -71,4 +77,6 @@ __all__ = [
     "reset_adapters",
     "resolve_adapter_for_source",
     "unregister",
+    "validate_adapter_schema",
+    "validate_drawer_metadata",
 ]

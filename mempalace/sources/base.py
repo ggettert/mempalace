@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import json
 from typing import TYPE_CHECKING, ClassVar, Iterator, Literal, Optional
 
 if TYPE_CHECKING:
@@ -32,6 +33,14 @@ if TYPE_CHECKING:
 
 class SourceAdapterError(Exception):
     """Base class for every source-adapter error raised by core."""
+
+
+class UnknownSourceAdapterError(SourceAdapterError):
+    """Raised when an explicitly selected adapter is not registered."""
+
+
+class SourceAdapterProtocolError(SourceAdapterError):
+    """Raised when an adapter violates the RFC 002 ingest protocol."""
 
 
 class SourceNotFoundError(SourceAdapterError):
@@ -150,6 +159,85 @@ class AdapterSchema:
 
     fields: dict[str, FieldSpec]
     version: str
+
+
+_METADATA_SCALAR_TYPES = (str, int, float, bool)
+
+
+def validate_adapter_schema(schema: AdapterSchema) -> None:
+    """Validate the portion of an RFC 002 schema core relies on at runtime.
+
+    Adapters are third-party code, so ``describe_schema`` cannot be trusted to
+    have constructed the dataclasses exactly as documented.  Fail before
+    extraction rather than allowing malformed metadata into a backend.
+    """
+    if not isinstance(schema, AdapterSchema) or not isinstance(schema.version, str):
+        raise SchemaConformanceError(
+            "describe_schema() must return an AdapterSchema with a string version"
+        )
+    if not isinstance(schema.fields, dict):
+        raise SchemaConformanceError("AdapterSchema.fields must be a dict")
+    for name, field_spec in schema.fields.items():
+        if not isinstance(name, str) or not name:
+            raise SchemaConformanceError("AdapterSchema field names must be non-empty strings")
+        if not isinstance(field_spec, FieldSpec):
+            raise SchemaConformanceError(f"schema field {name!r} must be a FieldSpec")
+        if field_spec.type not in {
+            "string",
+            "int",
+            "float",
+            "bool",
+            "delimiter_joined_string",
+            "json_string",
+        }:
+            raise SchemaConformanceError(
+                f"schema field {name!r} has unsupported type {field_spec.type!r}"
+            )
+
+
+def validate_drawer_metadata(metadata: dict, schema: AdapterSchema) -> None:
+    """Reject non-flat or schema-incompatible metadata before it is persisted."""
+    validate_adapter_schema(schema)
+    if not isinstance(metadata, dict):
+        raise SchemaConformanceError("DrawerRecord.metadata must be a dict")
+
+    for name, value in metadata.items():
+        if not isinstance(name, str) or not name:
+            raise SchemaConformanceError("DrawerRecord.metadata keys must be non-empty strings")
+        # ``bool`` is deliberately accepted as a scalar, even though it is an
+        # ``int`` subclass. Field-specific checks below use exact types.
+        if type(value) not in _METADATA_SCALAR_TYPES:
+            raise SchemaConformanceError(
+                f"metadata field {name!r} must be a flat str/int/float/bool value"
+            )
+
+    for name, field_spec in schema.fields.items():
+        if name not in metadata:
+            if field_spec.required:
+                raise SchemaConformanceError(f"metadata is missing required field {name!r}")
+            continue
+        value = metadata[name]
+        expected = field_spec.type
+        valid = (
+            (
+                expected in {"string", "delimiter_joined_string", "json_string"}
+                and type(value) is str
+            )
+            or (expected == "int" and type(value) is int)
+            or (expected == "float" and type(value) is float)
+            or (expected == "bool" and type(value) is bool)
+        )
+        if not valid:
+            raise SchemaConformanceError(
+                f"metadata field {name!r} must be {expected}, got {type(value).__name__}"
+            )
+        if expected == "json_string":
+            try:
+                json.loads(value)
+            except (TypeError, ValueError) as exc:
+                raise SchemaConformanceError(
+                    f"metadata field {name!r} must contain valid JSON"
+                ) from exc
 
 
 # The union type adapters yield from ``ingest``.

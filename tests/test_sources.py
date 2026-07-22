@@ -304,6 +304,49 @@ def test_palace_context_drawer_id_is_sha256_prefix_not_sha1():
     assert drawer_id != f"{sha1_prefix}_3"
 
 
+def test_palace_context_scopes_drawer_ids_and_core_identity_to_adapter():
+    """Adapters may ingest the same logical source without overwriting it."""
+    from mempalace.sources.context import _build_drawer_id
+
+    record = DrawerRecord(
+        content="hello",
+        source_file="github.com/org/repo#pr=1",
+        chunk_index=0,
+        metadata={
+            "source_file": "forged://source",
+            "chunk_index": 9,
+            "adapter_name": "forged",
+            "adapter_version": "0.0.0",
+        },
+    )
+    alpha_drawers = _FakeCollection()
+    beta_drawers = _FakeCollection()
+    kg = _FakeKG()
+    PalaceContext(
+        drawer_collection=alpha_drawers,
+        knowledge_graph=kg,
+        palace_path="/tmp/palace",
+        adapter_name="alpha",
+        adapter_version="1.0.0",
+    ).upsert_drawer(record)
+    PalaceContext(
+        drawer_collection=beta_drawers,
+        knowledge_graph=kg,
+        palace_path="/tmp/palace",
+        adapter_name="beta",
+        adapter_version="1.0.0",
+    ).upsert_drawer(record)
+
+    alpha = alpha_drawers.upserts[0]
+    beta = beta_drawers.upserts[0]
+    assert alpha["ids"] != beta["ids"]
+    assert alpha["ids"] == [_build_drawer_id(record, adapter_name="alpha")]
+    assert alpha["metadatas"][0]["source_file"] == record.source_file
+    assert alpha["metadatas"][0]["chunk_index"] == 0
+    assert alpha["metadatas"][0]["adapter_name"] == "alpha"
+    assert alpha["metadatas"][0]["adapter_version"] == "1.0.0"
+
+
 def test_palace_context_skip_current_item_sets_flag():
     ctx = PalaceContext(
         drawer_collection=_FakeCollection(),

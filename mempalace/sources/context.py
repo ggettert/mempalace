@@ -77,6 +77,7 @@ class PalaceContext:
     adapter_name: str = ""
     adapter_version: str = ""
     progress_hooks: list[ProgressHook] = field(default_factory=list)
+    dry_run: bool = False
 
     # Internal: flag set by :meth:`skip_current_item` and checked by the core
     # mine loop between yields. Not part of the adapter-facing contract; the
@@ -94,19 +95,62 @@ class PalaceContext:
         Applies the spec-mandated ``adapter_name`` and ``adapter_version``
         metadata stamps (§5.1) so adapters never need to populate them.
         """
+        if self.dry_run:
+            return
         meta = dict(record.metadata)
-        meta.setdefault("source_file", record.source_file)
-        meta.setdefault("chunk_index", record.chunk_index)
+        # These are core-owned identity fields.  Do not allow an adapter's
+        # arbitrary metadata to make a drawer appear to belong to another
+        # source item or chunk.
+        meta["source_file"] = record.source_file
+        meta["chunk_index"] = record.chunk_index
         if self.adapter_name:
-            meta.setdefault("adapter_name", self.adapter_name)
+            meta["adapter_name"] = self.adapter_name
         if self.adapter_version:
-            meta.setdefault("adapter_version", self.adapter_version)
-        drawer_id = _build_drawer_id(record)
+            meta["adapter_version"] = self.adapter_version
+        drawer_id = _build_drawer_id(record, adapter_name=self.adapter_name)
         self.drawer_collection.upsert(
             documents=[record.content],
             ids=[drawer_id],
             metadatas=[meta],
         )
+
+    def existing_metadata(self, source_file: str) -> Optional[dict]:
+        """Return one stored metadata record for an RFC 002 source item.
+
+        The source item, rather than a separate cursor table, is the
+        incremental-ingest cursor.  A dry-run context deliberately has a
+        no-op collection and therefore reports no prior state.
+        """
+        result = self.drawer_collection.get(where=self._source_item_where(source_file), limit=1)
+        if not isinstance(result, dict):
+            return None
+        metadata = result.get("metadatas") or []
+        return metadata[0] if metadata and isinstance(metadata[0], dict) else None
+
+    def delete_source_item(self, source_file: str) -> None:
+        """Purge all drawers for a tombstoned source item.
+
+        ``source_file`` is adapter-defined, not a globally namespaced ID.
+        Scope the mutation to this adapter so two adapters that intentionally
+        ingest the same logical source do not delete each other's drawers.
+        """
+        if not self.dry_run:
+            self.drawer_collection.delete(where=self._source_item_where(source_file))
+
+    def replace_source_item(self, source_file: str) -> None:
+        """Clear a stale source item before writing its replacement drawers."""
+        self.delete_source_item(source_file)
+
+    def _source_item_where(self, source_file: str) -> dict:
+        """Return the backend filter identifying this adapter's source item."""
+        if not self.adapter_name:
+            return {"source_file": source_file}
+        return {
+            "$and": [
+                {"source_file": source_file},
+                {"adapter_name": self.adapter_name},
+            ]
+        }
 
     def skip_current_item(self) -> None:
         """Signal to core that the current ``SourceItemMetadata`` is up-to-date
@@ -125,8 +169,8 @@ class PalaceContext:
                 logging.getLogger(__name__).exception("progress hook failed on %r", event)
 
 
-def _build_drawer_id(record: DrawerRecord) -> str:
-    """Deterministic drawer id: ``<sha256(source_file)[:24]>_<chunk_index>``.
+def _build_drawer_id(record: DrawerRecord, *, adapter_name: str = "") -> str:
+    """Deterministic drawer id: ``<sha256(adapter + source_file)[:24]>_<chunk_index>``.
 
     Matches the shape existing miners rely on (``source_file`` + chunk index
     pair) while keeping the id chroma-safe (no separators that collide with
@@ -138,5 +182,10 @@ def _build_drawer_id(record: DrawerRecord) -> str:
     """
     import hashlib
 
-    digest = hashlib.sha256(record.source_file.encode("utf-8")).hexdigest()[:24]
+    identity = record.source_file
+    if adapter_name:
+        # Source identities are scoped to their adapter under RFC 002.  The
+        # separator makes ("ab", "c") distinct from ("a", "bc").
+        identity = f"{adapter_name}\0{record.source_file}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
     return f"{digest}_{record.chunk_index}"

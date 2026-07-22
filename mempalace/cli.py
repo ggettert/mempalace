@@ -35,6 +35,7 @@ import os
 import sys
 import shlex
 import argparse
+import json
 from pathlib import Path
 
 from .config import MempalaceConfig
@@ -550,7 +551,23 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     mode = getattr(args, "mode", None) or "projects"
-    source_adapter = getattr(args, "source", None)
+    # ``dir`` remains a compatibility fallback for callers that construct an
+    # argparse.Namespace themselves. The public positional is now a source
+    # reference: legacy modes read it as a directory, explicit adapters may
+    # receive it as either a local path or URI.
+    source_input = getattr(args, "source_input", getattr(args, "dir", None))
+    source_adapter = getattr(args, "source_adapter", getattr(args, "source", None))
+    source_is_uri = bool(getattr(args, "source_uri", False))
+    try:
+        source_options = _parse_source_options(getattr(args, "source_option", []))
+    except argparse.ArgumentTypeError as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if source_adapter and args.wing is not None:
+        source_options.setdefault("wing", args.wing)
+    if not source_adapter and (source_is_uri or source_options):
+        print("mempalace: --source-uri and --source-option require --source", file=sys.stderr)
+        sys.exit(2)
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
@@ -561,7 +578,7 @@ def cmd_mine(args):
 
     if getattr(args, "daemon", False):
         payload = {
-            "source": args.dir,
+            "source": source_input,
             "mode": mode,
             "wing": args.wing,
             "agent": args.agent,
@@ -575,20 +592,33 @@ def cmd_mine(args):
         }
         if source_adapter:
             payload["source_adapter"] = source_adapter
+            payload["source_uri"] = source_is_uri
+            payload["source_options"] = source_options
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
         return
 
     if source_adapter:
+        from .palace import MineAlreadyRunning
+        from .sources import SourceAdapterError, UnknownSourceAdapterError
+
         try:
             drawers_written = mine_source_adapter(
                 source_name=source_adapter,
-                source_path=args.dir,
+                source_path=source_input,
                 palace_path=palace_path,
                 dry_run=args.dry_run,
+                source_is_uri=source_is_uri,
+                source_options=source_options,
             )
         except UnknownSourceAdapterError as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(2)
+        except SourceAdapterError as exc:
+            print(f"mempalace: source adapter {source_adapter!r} failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except MineAlreadyRunning as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
         suffix = " would be written" if args.dry_run else " written"
         print(f"  Source adapter {source_adapter!r}: {drawers_written} drawer(s){suffix}.")
         return
@@ -598,7 +628,7 @@ def cmd_mine(args):
     # Heuristic-only by design — full LLM detection lives on `mempalace init`.
     if getattr(args, "redetect_origin", False):
         _run_pass_zero(
-            project_dir=args.dir,
+            project_dir=source_input,
             palace_dir=palace_path,
             llm_provider=None,
         )
@@ -610,7 +640,7 @@ def cmd_mine(args):
             from .convo_miner import mine_convos
 
             mine_convos(
-                convo_dir=args.dir,
+                convo_dir=source_input,
                 palace_path=palace_path,
                 wing=args.wing,
                 agent=args.agent,
@@ -622,7 +652,7 @@ def cmd_mine(args):
             from .format_miner import mine_formats
 
             mine_formats(
-                format_dir=args.dir,
+                format_dir=source_input,
                 palace_path=palace_path,
                 wing=args.wing,
                 agent=args.agent,
@@ -633,7 +663,7 @@ def cmd_mine(args):
             from .miner import mine
 
             mine(
-                project_dir=args.dir,
+                project_dir=source_input,
                 palace_path=palace_path,
                 wing_override=args.wing,
                 agent=args.agent,
@@ -670,16 +700,14 @@ def cmd_mine(args):
         sys.exit(1)
 
 
-class UnknownSourceAdapterError(ValueError):
-    """Raised when an explicit ``--source`` name is absent from the registry."""
-
-
 def mine_source_adapter(
     *,
     source_name: str,
     source_path: str,
     palace_path: str,
     dry_run: bool = False,
+    source_is_uri: bool = False,
+    source_options: dict | None = None,
 ) -> int:
     """Run an explicitly selected RFC 002 source adapter through ``PalaceContext``.
 
@@ -687,15 +715,20 @@ def mine_source_adapter(
     miners.  Until those miners are migrated to first-party adapters, no-flag
     and ``--mode`` calls must retain their established dispatch paths.
     """
-    from .knowledge_graph import KnowledgeGraph
-    from .palace import get_collection
     from .sources import (
         DrawerRecord,
         PalaceContext,
         SourceRef,
+        SourceAdapterProtocolError,
+        SourceItemMetadata,
+        SourceNotFoundError,
+        UnknownSourceAdapterError,
         get_adapter,
         resolve_adapter_for_source,
+        validate_adapter_schema,
+        validate_drawer_metadata,
     )
+    from .palace import mine_palace_lock
 
     adapter_name = resolve_adapter_for_source(explicit=source_name)
     try:
@@ -706,28 +739,173 @@ def mine_source_adapter(
             "check the adapter name with `mempalace mine --help`"
         ) from exc
 
-    knowledge_graph = KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))
-    try:
-        context = PalaceContext(
-            drawer_collection=get_collection(palace_path),
-            knowledge_graph=knowledge_graph,
-            palace_path=palace_path,
-            config=MempalaceConfig(palace_path=palace_path),
-            adapter_name=adapter.name,
-            adapter_version=adapter.adapter_version,
-        )
-        drawers_written = 0
-        for result in adapter.ingest(
-            source=SourceRef(local_path=source_path),
-            palace=context,
-        ):
-            if isinstance(result, DrawerRecord):
+    if not isinstance(source_path, str) or not source_path:
+        raise SourceNotFoundError("source reference must be a non-empty string")
+    if source_options is not None and not isinstance(source_options, dict):
+        raise SourceAdapterProtocolError("source_options must be a dict")
+    # Validate adapter-owned inputs before opening any palace state.  This is
+    # especially important for a malformed third-party adapter pointed at a
+    # new palace path: it must not leave a freshly-created collection behind.
+    schema = adapter.describe_schema()
+    validate_adapter_schema(schema)
+    # RFC 002 leaves URI canonicalization to the adapter, while the
+    # established filesystem miners normalize local paths to stable absolute
+    # identities before persisting them.
+    source = SourceRef(
+        uri=source_path if source_is_uri else None,
+        local_path=None if source_is_uri else str(Path(source_path).expanduser().resolve()),
+        options=dict(source_options or {}),
+    )
+
+    def run() -> int:
+        # A dry run must not create a collection, SQLite database, or lock
+        # file. The facade remains safe even for adapters that bypass its
+        # upsert helper and touch drawer_collection directly.
+        if dry_run:
+            collection = _DryRunCollection()
+            knowledge_graph = _DryRunKnowledgeGraph()
+        else:
+            from .knowledge_graph import KnowledgeGraph
+            from .palace import get_collection
+
+            collection = get_collection(palace_path)
+            knowledge_graph = KnowledgeGraph(
+                db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
+            )
+
+        try:
+            context = PalaceContext(
+                drawer_collection=collection,
+                knowledge_graph=knowledge_graph,
+                palace_path=palace_path,
+                config=MempalaceConfig(palace_path=palace_path),
+                adapter_name=adapter.name,
+                adapter_version=adapter.adapter_version,
+                dry_run=dry_run,
+            )
+            drawers_written = 0
+            current_item = None
+            replaced_source_items = set()
+            for result in adapter.ingest(source=source, palace=context):
+                if isinstance(result, SourceItemMetadata):
+                    if not result.source_file or not isinstance(result.source_file, str):
+                        raise SourceAdapterProtocolError(
+                            "SourceItemMetadata.source_file must be a non-empty string"
+                        )
+                    if not isinstance(result.version, str):
+                        raise SourceAdapterProtocolError(
+                            "SourceItemMetadata.version must be a string"
+                        )
+                    current_item = result
+                    context._skip_requested = False
+                    if result.version == "__deleted__":
+                        context.delete_source_item(result.source_file)
+                        replaced_source_items.add(result.source_file)
+                        context.skip_current_item()
+                        continue
+                    existing = context.existing_metadata(result.source_file)
+                    if adapter.is_current(item=result, existing_metadata=existing):
+                        context.skip_current_item()
+                    elif result.source_file not in replaced_source_items:
+                        # A changed item can shrink from N chunks to M chunks.
+                        # Replace it as a unit rather than upserting M records
+                        # and leaving stale chunks N..M behind.
+                        context.replace_source_item(result.source_file)
+                        replaced_source_items.add(result.source_file)
+                    continue
+                if not isinstance(result, DrawerRecord):
+                    raise SourceAdapterProtocolError(
+                        "ingest() yielded an unsupported result; expected "
+                        "SourceItemMetadata or DrawerRecord"
+                    )
+                if (
+                    not isinstance(result.content, str)
+                    or not isinstance(result.source_file, str)
+                    or not result.source_file
+                ):
+                    raise SourceAdapterProtocolError(
+                        "DrawerRecord.content must be a string and source_file must be a non-empty string"
+                    )
+                if type(result.chunk_index) is not int:
+                    raise SourceAdapterProtocolError("DrawerRecord.chunk_index must be an int")
+                validate_drawer_metadata(result.metadata, schema)
+                # A skip applies only to the currently announced source item;
+                # adapters may freely interleave drawers for other items.
+                if (
+                    current_item is not None
+                    and context._skip_requested
+                    and (result.source_file == current_item.source_file)
+                ):
+                    continue
+                if result.source_file not in replaced_source_items:
+                    # Eager adapters are not required to announce metadata.
+                    # They still need replacement semantics so an item whose
+                    # chunk count drops cannot retain stale old drawers.
+                    context.replace_source_item(result.source_file)
+                    replaced_source_items.add(result.source_file)
                 drawers_written += 1
-                if not dry_run:
-                    context.upsert_drawer(result)
-        return drawers_written
-    finally:
-        knowledge_graph.close()
+                context.upsert_drawer(result)
+            return drawers_written
+        finally:
+            if not dry_run:
+                knowledge_graph.close()
+
+    # Legacy miners already acquire this palace-wide lock themselves. Adapter
+    # writes need the same lifecycle; daemon jobs call this function too.
+    if dry_run:
+        return run()
+    with mine_palace_lock(palace_path):
+        return run()
+
+
+class _DryRunCollection:
+    """Read-free, write-free collection facade for adapter dry runs."""
+
+    def get(self, **_kwargs):
+        return {"metadatas": []}
+
+    def upsert(self, **_kwargs):
+        return None
+
+    def add(self, **_kwargs):
+        return None
+
+    def delete(self, **_kwargs):
+        return None
+
+    def query(self, **_kwargs):
+        return {"ids": [], "documents": [], "metadatas": []}
+
+    def count(self):
+        return 0
+
+
+class _DryRunKnowledgeGraph:
+    """No-op KG facade: dry-run adapters cannot persist triples."""
+
+    def add_triple(self, *_args, **_kwargs):
+        return None
+
+
+def _parse_source_options(raw_options) -> dict:
+    """Parse repeatable ``KEY=VALUE`` adapter options without guessing keys.
+
+    Values use JSON when possible, otherwise remain strings. This preserves
+    generic, documented adapter option forwarding while keeping legacy modes
+    untouched.
+    """
+    options = {}
+    for raw in raw_options or []:
+        if "=" not in raw:
+            raise argparse.ArgumentTypeError("--source-option must be KEY=VALUE")
+        key, value = raw.split("=", 1)
+        if not key:
+            raise argparse.ArgumentTypeError("--source-option key must not be empty")
+        try:
+            options[key] = json.loads(value)
+        except json.JSONDecodeError:
+            options[key] = value
+    return options
 
 
 def cmd_sweep(args):
@@ -1877,8 +2055,11 @@ def main():
     )
 
     # mine
-    p_mine = sub.add_parser("mine", help="Mine files into the palace")
-    p_mine.add_argument("dir", help="Directory to mine")
+    p_mine = sub.add_parser("mine", help="Mine a source into the palace")
+    p_mine.add_argument(
+        "source_input",
+        help="Directory for legacy modes, or a source reference for --source adapters",
+    )
     p_mine.add_argument(
         "--backend",
         default=None,
@@ -1897,11 +2078,27 @@ def main():
     )
     mine_source_group.add_argument(
         "--source",
+        dest="source_adapter",
         default=None,
         metavar="ADAPTER",
         help=(
             "Use a registered source adapter. Cannot be combined with --mode; "
             "no --source preserves legacy projects-mode mining."
+        ),
+    )
+    p_mine.add_argument(
+        "--source-uri",
+        action="store_true",
+        help="Pass the positional source reference to --source as SourceRef.uri (not local_path)",
+    )
+    p_mine.add_argument(
+        "--source-option",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Forward a non-secret adapter option; repeatable. VALUE is parsed as JSON when valid, "
+            "otherwise passed as a string. Requires --source."
         ),
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")

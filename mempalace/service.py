@@ -167,11 +167,27 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
         if source_adapter:
             from .cli import mine_source_adapter
 
+            source_options = payload.get("source_options") or {}
+            if not isinstance(source_options, dict):
+                return {
+                    "success": False,
+                    "error": "source_options must be an object",
+                    "error_class": "SourceAdapterProtocolError",
+                    "exit_code": 2,
+                }
+            # The CLI forwards --wing as an adapter option per RFC 002 §2.5.
+            # Preserve that behavior for daemon callers that submit a payload
+            # directly instead of coming through cmd_mine.
+            if wing is not None:
+                source_options = dict(source_options)
+                source_options.setdefault("wing", wing)
             mine_source_adapter(
                 source_name=source_adapter,
                 source_path=source,
                 palace_path=palace_path,
                 dry_run=dry_run,
+                source_is_uri=bool(payload.get("source_uri")),
+                source_options=source_options,
             )
         elif mode == "convos":
             from .convo_miner import mine_convos
@@ -236,6 +252,24 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
             "exit_code": code,
         }
     except Exception as exc:
+        # Import only on the adapter path so the daemon keeps its lightweight
+        # startup behavior for ordinary legacy mine jobs.
+        from .sources import SourceAdapterError, UnknownSourceAdapterError
+
+        if isinstance(exc, UnknownSourceAdapterError):
+            return {
+                "success": False,
+                "error": str(exc),
+                "error_class": type(exc).__name__,
+                "exit_code": 2,
+            }
+        if isinstance(exc, SourceAdapterError):
+            return {
+                "success": False,
+                "error": str(exc),
+                "error_class": type(exc).__name__,
+                "exit_code": 1,
+            }
         return {"success": False, "error": f"mine failed: {exc}", "exit_code": 1}
 
     result_mode = "source" if source_adapter else mode
