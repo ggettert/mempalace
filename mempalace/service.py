@@ -175,7 +175,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                     "error_class": "SourceAdapterProtocolError",
                     "exit_code": 2,
                 }
-            # The CLI forwards --wing as an adapter option per RFC 002 §2.5.
+            # The CLI forwards --wing as an adapter option under the RFC 002 routing rules.
             # Preserve that behavior for daemon callers that submit a payload
             # directly instead of coming through cmd_mine.
             if wing is not None:
