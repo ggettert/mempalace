@@ -149,13 +149,14 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     _apply_backend(payload.get("backend"))
 
     source = payload.get("source") or payload.get("dir")
+    source_adapter = payload.get("source_adapter")
     mode = payload.get("mode") or "projects"
     wing = payload.get("wing")
     agent = payload.get("agent") or "mempalace"
     limit = int(payload.get("limit") or 0)
     dry_run = bool(payload.get("dry_run"))
 
-    if payload.get("redetect_origin"):
+    if payload.get("redetect_origin") and not source_adapter:
         from .cli import _run_pass_zero
 
         _run_pass_zero(project_dir=source, palace_dir=palace_path, llm_provider=None)
@@ -163,7 +164,16 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     from .palace import MineAlreadyRunning, MineValidationError
 
     try:
-        if mode == "convos":
+        if source_adapter:
+            from .cli import mine_source_adapter
+
+            mine_source_adapter(
+                source_name=source_adapter,
+                source_path=source,
+                palace_path=palace_path,
+                dry_run=dry_run,
+            )
+        elif mode == "convos":
             from .convo_miner import mine_convos
 
             mine_convos(
@@ -228,7 +238,14 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         return {"success": False, "error": f"mine failed: {exc}", "exit_code": 1}
 
-    return {"success": True, "kind": "mine", "mode": mode, "dry_run": dry_run, "exit_code": 0}
+    result_mode = "source" if source_adapter else mode
+    return {
+        "success": True,
+        "kind": "mine",
+        "mode": result_mode,
+        "dry_run": dry_run,
+        "exit_code": 0,
+    }
 
 
 def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
