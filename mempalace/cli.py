@@ -929,8 +929,8 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                     state["skip"] = True
                     state["reconcile"] = True
 
-                # Phase 2: all protocol/schema/route checks have succeeded.
-                # Only now can stale source drawers be replaced or removed.
+                # After all protocol, schema, and route checks have succeeded,
+                # stale source drawers can be replaced or removed.
                 context.staging = False
                 context.default_route_hint = default_route
                 for source_file, state in states.items():
