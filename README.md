@@ -132,6 +132,8 @@ variables, namespace behavior, and deployment notes.
 # Mine content into the palace
 mempalace mine ~/projects/myapp                    # project files
 mempalace mine ~/.claude/projects/ --mode convos   # Claude Code sessions (scope with --wing per project)
+# Registered source adapter (adapter package must be installed)
+mempalace mine github.com/acme/widgets --source git --source-uri --source-option branch=main
 
 # Search
 mempalace search "why did we switch to GraphQL"
@@ -143,6 +145,11 @@ mempalace wake-up
 For Claude Code, Gemini CLI, [Antigravity](https://mempalaceofficial.com/guide/antigravity.html),
 MCP-compatible tools, and local models, see
 [mempalaceofficial.com/guide/getting-started](https://mempalaceofficial.com/guide/getting-started.html).
+
+MCP clients can use the same adapter path through `mempalace_mine` with
+`source_adapter`, `source_uri`, and a non-secret `source_options` object (for
+example `{"branch": "main"}`). Adapter credentials belong in
+`MEMPALACE_SOURCE_<NAME>_*` environment variables, never in CLI/MCP options.
 
 ---
 

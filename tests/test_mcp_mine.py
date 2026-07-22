@@ -77,6 +77,27 @@ def test_mcp_source_adapter_dispatches_uri_through_cli_route(monkeypatch, config
     }
 
 
+def test_mcp_source_adapter_rejects_non_object_options_and_reports_privacy_rejection(monkeypatch, config):
+    from mempalace import cli, mcp_server
+    from mempalace.sources import PrivacyClassRejectedError
+
+    _patch(monkeypatch, config)
+    invalid = mcp_server.tool_mine(source="x", source_adapter="fixture", source_options=[])
+    assert invalid["success"] is False
+    assert invalid["error_class"] == "SourceAdapterProtocolError"
+
+    monkeypatch.setattr(
+        cli,
+        "mine_source_adapter",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            PrivacyClassRejectedError("blocked", privacy_class="sensitive", privacy_floor="internal")
+        ),
+    )
+    rejected = mcp_server.tool_mine(source="x", source_adapter="fixture")
+    assert rejected["success"] is True
+    assert rejected["rejected"][0]["privacy_floor"] == "internal"
+
+
 # ── Guard rails ──────────────────────────────────────────────────────────
 
 

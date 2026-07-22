@@ -15,11 +15,17 @@ contract is stable.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Protocol
 
-from .base import DrawerRecord, RouteHint, validate_privacy_class
+from .base import (
+    DrawerRecord,
+    RouteHint,
+    SourceAdapterProtocolError,
+    validate_privacy_class,
+    validate_route_hint,
+)
 
 
 class _CollectionLike(Protocol):
@@ -44,6 +50,37 @@ class _KnowledgeGraphLike(Protocol):
 
 # Progress hook signature: ``fn(event_name, **details) -> None``.
 ProgressHook = Callable[..., None]
+
+
+class _AdapterCollectionFacade:
+    """Read-only collection view exposed to adapters.
+
+    Source adapters must use :meth:`PalaceContext.upsert_drawer` and the core
+    reconciliation loop for writes.  Returning the backend collection directly
+    let an adapter bypass metadata stamps, schema validation, adapter scoping,
+    and staged replacement entirely.
+    """
+
+    def __init__(self, collection: _CollectionLike):
+        self._collection = collection
+
+    def get(self, **kwargs: Any) -> Any:
+        return self._collection.get(**kwargs)
+
+    def query(self, **kwargs: Any) -> Any:
+        return self._collection.query(**kwargs)
+
+    def count(self) -> int:
+        return self._collection.count()
+
+    def _reject_write(self, *_args: Any, **_kwargs: Any) -> None:
+        raise SourceAdapterProtocolError(
+            "adapters must use PalaceContext.upsert_drawer; raw collection writes are not allowed"
+        )
+
+    add = _reject_write
+    upsert = _reject_write
+    delete = _reject_write
 
 
 @dataclass
@@ -82,12 +119,22 @@ class PalaceContext:
     default_route_hint: Optional[RouteHint] = None
     progress_hooks: list[ProgressHook] = field(default_factory=list)
     dry_run: bool = False
+    staging: bool = False
 
     # Internal: flag set by :meth:`skip_current_item` and checked by the core
     # mine loop between yields. Not part of the adapter-facing contract; the
     # adapter only needs to know that calling :meth:`skip_current_item` stops
     # drawer emission for the current ``SourceItemMetadata``.
     _skip_requested: bool = False
+    _storage_collection: _CollectionLike = field(init=False, repr=False)
+    _staged_drawers: list[DrawerRecord] = field(default_factory=list, init=False, repr=False)
+    _staged_deletes: set[str] = field(default_factory=set, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Keep the construction signature stable while replacing the public
+        # backend handle with a constrained view before any adapter sees it.
+        self._storage_collection = self.drawer_collection
+        self.drawer_collection = _AdapterCollectionFacade(self._storage_collection)
 
     # ------------------------------------------------------------------
     # Adapter-facing surface
@@ -99,6 +146,15 @@ class PalaceContext:
         Applies the spec-mandated ``adapter_name`` and ``adapter_version``
         metadata stamps (§5.1) so adapters never need to populate them.
         """
+        if self.staging:
+            # Capture the effective route now: adapters may announce another
+            # item before core commits this staged record.
+            route = _merge_route_hints(self.default_route_hint, record.route_hint)
+            validate_route_hint(self.default_route_hint)
+            validate_route_hint(record.route_hint)
+            validate_route_hint(route)
+            self._staged_drawers.append(replace(record, route_hint=route))
+            return
         if self.dry_run:
             return
         meta = dict(record.metadata)
@@ -130,7 +186,10 @@ class PalaceContext:
         meta["room"] = route.room or "general"
         meta["hall"] = route.hall or "general"
         drawer_id = _build_drawer_id(record, adapter_name=self.adapter_name)
-        self.drawer_collection.upsert(
+        validate_route_hint(self.default_route_hint)
+        validate_route_hint(record.route_hint)
+        validate_route_hint(route)
+        self._storage_collection.upsert(
             documents=[record.content],
             ids=[drawer_id],
             metadatas=[meta],
@@ -143,7 +202,7 @@ class PalaceContext:
         incremental-ingest cursor.  A dry-run context deliberately has a
         no-op collection and therefore reports no prior state.
         """
-        result = self.drawer_collection.get(where=self._source_item_where(source_file), limit=1)
+        result = self._storage_collection.get(where=self._source_item_where(source_file), limit=1)
         if not isinstance(result, dict):
             return None
         metadata = result.get("metadatas") or []
@@ -156,8 +215,10 @@ class PalaceContext:
         Scope the mutation to this adapter so two adapters that intentionally
         ingest the same logical source do not delete each other's drawers.
         """
-        if not self.dry_run:
-            self.drawer_collection.delete(where=self._source_item_where(source_file))
+        if self.staging:
+            self._staged_deletes.add(source_file)
+        elif not self.dry_run:
+            self._storage_collection.delete(where=self._source_item_where(source_file))
 
     def replace_source_item(self, source_file: str) -> None:
         """Clear a stale source item before writing its replacement drawers."""
@@ -179,6 +240,16 @@ class PalaceContext:
         and no drawers should be emitted for it. Core resets the flag after
         advancing past the item."""
         self._skip_requested = True
+
+    def drain_staged_mutations(self) -> tuple[list[DrawerRecord], set[str]]:
+        """Return staged adapter helper mutations after a successful ingest.
+
+        This is intentionally a core-only escape hatch despite being public
+        Python for testability.  It never exposes the raw backend collection.
+        """
+        drawers, deletes = self._staged_drawers, self._staged_deletes
+        self._staged_drawers, self._staged_deletes = [], set()
+        return drawers, deletes
 
     def emit(self, event: str, **details: Any) -> None:
         """Invoke each registered progress hook with ``(event, **details)``."""

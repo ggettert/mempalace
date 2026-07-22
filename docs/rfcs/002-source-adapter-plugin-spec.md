@@ -457,6 +457,13 @@ Single-user local mode: config is optional. `mempalace mine <path>` with no conf
 
 `SourceRef.options` is a free-form dict of non-secret values (§2.2). Each adapter documents its accepted keys. Unknown keys MUST be ignored (forward compatibility); the adapter MAY log a warning.
 
+The CLI forwards repeatable `--source-option KEY=VALUE` values (JSON values are
+decoded when possible). MCP's `mempalace_mine` accepts the equivalent
+`source_adapter`, `source_uri`, and `source_options` object. Core recursively
+rejects secret-like keys and recognizable credential/token values, including
+inside nested option objects and JSON-encoded strings. Credentials belong only
+in `MEMPALACE_SOURCE_<NAME>_*` environment variables.
+
 ---
 
 ## 5. Metadata schema contract
@@ -489,6 +496,11 @@ Existing fields retain their current semantics (verified against `miner.py:542-5
 **Nothing is renamed. Nothing is removed.** The spec formalizes the shape ingesters already converge on. Existing `where={"source_file": ...}` queries in `searcher.py`, `palace.py`, and callers keep working.
 
 **Chroma metadata constraint:** all metadata values MUST be `str | int | float | bool`. No lists, no nested dicts. This matches RFC 001 §1.4 and the underlying ChromaDB contract. Structured side-data goes to the SQLite knowledge graph (§5.5) or to a declared flat JSON-encoded string field (§5.4).
+
+At runtime, every adapter-provided metadata key MUST be declared by its
+`AdapterSchema`, except the universal fields listed above. Core owns and stamps
+universal identity, routing, privacy, and audit values; adapters cannot use
+them to override core policy.
 
 ### 5.2 Adapter schemas
 

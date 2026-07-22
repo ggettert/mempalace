@@ -43,10 +43,12 @@ from .base import (
     validate_route_hint,
     validate_source_options,
     privacy_class_is_admitted,
+    UNIVERSAL_METADATA_FIELDS,
 )
 from .context import PalaceContext, ProgressHook
 from .registry import (
     available_adapters,
+    adapter_session,
     get_adapter,
     get_adapter_class,
     register,
@@ -79,6 +81,7 @@ __all__ = [
     "TransformationViolationError",
     "UnknownSourceAdapterError",
     "available_adapters",
+    "adapter_session",
     "get_adapter",
     "get_adapter_class",
     "register",
@@ -91,4 +94,5 @@ __all__ = [
     "validate_route_hint",
     "validate_source_options",
     "privacy_class_is_admitted",
+    "UNIVERSAL_METADATA_FIELDS",
 ]

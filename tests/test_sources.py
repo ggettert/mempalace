@@ -12,16 +12,21 @@ from mempalace.sources import (
     FieldSpec,
     PalaceContext,
     RouteHint,
+    SchemaConformanceError,
+    SourceAdapterProtocolError,
     SourceItemMetadata,
     SourceRef,
     SourceSummary,
     available_adapters,
+    adapter_session,
     get_adapter,
     get_adapter_class,
     register,
     reset_adapters,
     resolve_adapter_for_source,
     unregister,
+    validate_drawer_metadata,
+    validate_source_options,
 )
 from mempalace.sources.transforms import (
     RESERVED_TRANSFORMATIONS,
@@ -111,6 +116,30 @@ def test_source_ref_options_default_is_empty_dict():
     b = SourceRef(uri="b")
     a.options["touched"] = True
     assert "touched" not in b.options
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"connection": {"headers": {"Authorization": "Bearer abcdefghijklmnopqrstuvwxyz"}}},
+        {"connection": '{"auth":{"accessToken":"abcdefghijklmno"}}'},
+        {"payload": "github_pat_abcdefghijklmnopqrstuvwxyz0123456789"},
+    ],
+)
+def test_source_options_reject_nested_secret_keys_and_token_values(options):
+    with pytest.raises(SourceAdapterProtocolError, match="credentials|secret-like"):
+        validate_source_options(options)
+
+
+def test_metadata_rejects_undeclared_fields_but_allows_documented_universal_fields():
+    schema = AdapterSchema(
+        version="1.0", fields={"repo": FieldSpec(type="string", required=True, description="repo")}
+    )
+    validate_drawer_metadata(
+        {"repo": "mempalace", "wing": "core", "privacy_class": "internal"}, schema
+    )
+    with pytest.raises(SchemaConformanceError, match="not declared"):
+        validate_drawer_metadata({"repo": "mempalace", "surprise": "nope"}, schema)
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +258,23 @@ def test_registry_closes_cached_instances_on_replacement_unregister_and_reset():
     third = get_adapter("closable")
     reset_adapters()
     assert ClosableAdapter.closed == [first, second, third]
+
+
+def test_registry_defers_close_until_an_active_adapter_session_finishes():
+    class ClosableAdapter(_TrivialAdapter):
+        name = "leased"
+        closed = []
+
+        def close(self):
+            self.__class__.closed.append(self)
+
+    register("leased", ClosableAdapter)
+    with adapter_session("leased") as active:
+        register("leased", ClosableAdapter)
+        # A registry replacement must not invalidate an in-flight mine.
+        assert ClosableAdapter.closed == []
+        assert active.name == "leased"
+    assert ClosableAdapter.closed == [active]
 
 
 def test_resolve_adapter_priority_order():

@@ -192,23 +192,99 @@ _SECRET_OPTION_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Values can reach this API through the daemon and MCP as structured JSON, not
+# just through CLI ``KEY=VALUE`` arguments.  Catch common credential formats
+# there too; accepting a harmless-looking parent option such as
+# ``connection={"headers":{"Authorization":"Bearer …"}}`` would otherwise
+# make the non-secret options contract trivial to bypass.
+_SECRET_VALUE_PATTERNS = (
+    re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\b(?:bearer|basic)\s+[A-Za-z0-9._~+/-]{16,}\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|secret|token|private[_-]?key)\s*=\s*[^\s&]{8,}",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _validate_source_option_value(value: object, *, path: str, seen: set[int]) -> None:
+    """Recursively enforce the non-secret ``SourceRef.options`` contract.
+
+    JSON strings are parsed as well as native mappings/lists because CLI
+    options commonly arrive as a single JSON value.  ``seen`` avoids loops in
+    programmatic callers that hand us a self-referential mapping/list.
+    """
+    if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in seen:
+            return
+        seen.add(value_id)
+        for key, nested in value.items():
+            if not isinstance(key, str) or not key:
+                raise SourceAdapterProtocolError("source option keys must be non-empty strings")
+            _validate_source_option_key(key, path=f"{path}.{key}")
+            _validate_source_option_value(nested, path=f"{path}.{key}", seen=seen)
+        return
+    if isinstance(value, (list, tuple)):
+        value_id = id(value)
+        if value_id in seen:
+            return
+        seen.add(value_id)
+        for index, nested in enumerate(value):
+            _validate_source_option_value(nested, path=f"{path}[{index}]", seen=seen)
+        return
+    if not isinstance(value, str):
+        return
+    for pattern in _SECRET_VALUE_PATTERNS:
+        if pattern.search(value):
+            raise SourceAdapterProtocolError(
+                f"source option {path!r} appears to contain credentials; provide them through environment variables"
+            )
+    # A JSON string can conceal nested credential keys/values.  Only recurse
+    # into object/array JSON; quoted ordinary strings are still checked above.
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return
+    if isinstance(parsed, (dict, list)):
+        _validate_source_option_value(parsed, path=path, seen=seen)
+
+
+def _validate_source_option_key(key: str, *, path: str) -> None:
+    # Also catch compact spellings such as ``apiKey`` and ``accessToken``.
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    if _SECRET_OPTION_KEY_RE.search(key) or any(
+        marker in normalized
+        for marker in (
+            "apikey",
+            "authtoken",
+            "accesstoken",
+            "credential",
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "privatekey",
+        )
+    ):
+        raise SourceAdapterProtocolError(
+            f"source option {path!r} looks secret-like; provide credentials through environment variables"
+        )
+
 
 def validate_source_options(options: dict) -> None:
-    """Reject malformed or secret-like adapter option keys before ingestion."""
+    """Reject malformed or secret-like adapter options before ingestion."""
     if not isinstance(options, dict):
         raise SourceAdapterProtocolError("source_options must be a dict")
-    for key in options:
+    for key, value in options.items():
         if not isinstance(key, str) or not key:
             raise SourceAdapterProtocolError("source option keys must be non-empty strings")
-        # Also catch compact spellings such as ``apiKey`` and ``accessToken``.
-        normalized = re.sub(r"[^a-z0-9]", "", key.lower())
-        if _SECRET_OPTION_KEY_RE.search(key) or any(
-            marker in normalized
-            for marker in ("apikey", "authtoken", "accesstoken", "credential", "password", "passwd", "secret", "token", "privatekey")
-        ):
-            raise SourceAdapterProtocolError(
-                f"source option {key!r} looks secret-like; provide credentials through environment variables"
-            )
+        _validate_source_option_key(key, path=key)
+        _validate_source_option_value(value, path=key, seen=set())
 
 
 def validate_privacy_class(value: str, *, field_name: str = "privacy_class") -> str:
@@ -239,6 +315,30 @@ def validate_route_hint(route_hint: RouteHint | None) -> None:
             raise SourceAdapterProtocolError(
                 f"route_hint.{field_name} must be a non-empty string or None"
             )
+
+
+# These are written by core and are intentionally accepted in adapter
+# metadata for compatibility.  All other metadata must be declared by the
+# adapter schema so arbitrary third-party fields cannot silently reach storage.
+UNIVERSAL_METADATA_FIELDS = frozenset(
+    {
+        "adapter_name",
+        "adapter_version",
+        "added_by",
+        "chunk_index",
+        "entities",
+        "extract_mode",
+        "filed_at",
+        "hall",
+        "privacy_class",
+        "room",
+        "source_file",
+        "source_mtime",
+        "normalize_version",
+        "ingest_mode",
+        "wing",
+    }
+)
 
 
 def validate_adapter_schema(schema: AdapterSchema) -> None:
@@ -281,6 +381,10 @@ def validate_drawer_metadata(metadata: dict, schema: AdapterSchema) -> None:
     for name, value in metadata.items():
         if not isinstance(name, str) or not name:
             raise SchemaConformanceError("DrawerRecord.metadata keys must be non-empty strings")
+        if name not in schema.fields and name not in UNIVERSAL_METADATA_FIELDS:
+            raise SchemaConformanceError(
+                f"metadata field {name!r} is not declared by the adapter schema"
+            )
         # ``bool`` is deliberately accepted as a scalar, even though it is an
         # ``int`` subclass. Field-specific checks below use exact types.
         if type(value) not in _METADATA_SCALAR_TYPES:

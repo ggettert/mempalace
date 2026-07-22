@@ -711,7 +711,7 @@ def cmd_mine(args):
         sys.exit(1)
 
 
-def mine_source_adapter(
+def mine_source_adapter(  # noqa: C901 - staged protocol validation is intentionally centralized
     *,
     source_name: str,
     source_path: str,
@@ -721,21 +721,25 @@ def mine_source_adapter(
     source_options: dict | None = None,
     agent: str = "mempalace",
 ) -> int:
-    """Run an explicitly selected RFC 002 source adapter through ``PalaceContext``.
+    """Run an explicit RFC 002 adapter with staged, per-source reconciliation.
 
-    This deliberately sits alongside, rather than inside, the legacy mode
-    miners.  Until those miners are migrated to first-party adapters, no-flag
-    and ``--mode`` calls must retain their established dispatch paths.
+    Adapter output is completely consumed and validated before any existing
+    source item is deleted.  This protects a prior good ingest when a lazy
+    adapter later raises or yields malformed data; only a successfully staged
+    run reaches the destructive reconciliation phase.
     """
+    from dataclasses import replace
+
     from .sources import (
         DrawerRecord,
         PalaceContext,
+        RouteHint,
         SourceRef,
         SourceAdapterProtocolError,
         SourceItemMetadata,
         SourceNotFoundError,
         UnknownSourceAdapterError,
-        get_adapter,
+        adapter_session,
         privacy_class_is_admitted,
         resolve_adapter_for_source,
         validate_adapter_schema,
@@ -747,14 +751,6 @@ def mine_source_adapter(
     from .palace import mine_palace_lock
 
     adapter_name = resolve_adapter_for_source(explicit=source_name)
-    try:
-        adapter = get_adapter(adapter_name)
-    except KeyError as exc:
-        raise UnknownSourceAdapterError(
-            f"unknown source adapter {adapter_name!r}; install its adapter package or "
-            "check the adapter name with `mempalace mine --help`"
-        ) from exc
-
     if not isinstance(source_path, str) or not source_path:
         raise SourceNotFoundError("source reference must be a non-empty string")
     if source_options is not None and not isinstance(source_options, dict):
@@ -763,160 +759,202 @@ def mine_source_adapter(
     validate_source_options(source_options)
     if not isinstance(agent, str) or not agent:
         raise SourceAdapterProtocolError("agent must be a non-empty string")
-    # The registration key, not mutable adapter output, is the persisted
-    # namespace.  This prevents an adapter registered under one identity from
-    # replacing/tombstoning drawers belonging to a differently named adapter.
-    if not isinstance(adapter.name, str) or adapter.name != adapter_name:
-        raise SourceAdapterProtocolError(
-            f"registered adapter {adapter_name!r} must declare matching name; got {adapter.name!r}"
-        )
-    if not isinstance(adapter.adapter_version, str) or not adapter.adapter_version:
-        raise SourceAdapterProtocolError("adapter_version must be a non-empty string")
-    # Validate adapter-owned inputs before opening any palace state.  This is
-    # especially important for a malformed third-party adapter pointed at a
-    # new palace path: it must not leave a freshly-created collection behind.
-    schema = adapter.describe_schema()
-    validate_adapter_schema(schema)
-    # RFC 002 leaves URI canonicalization to the adapter, while the
-    # established filesystem miners normalize local paths to stable absolute
-    # identities before persisting them.
-    source = SourceRef(
-        uri=source_path if source_is_uri else None,
-        local_path=None if source_is_uri else str(Path(source_path).expanduser().resolve()),
-        options=source_options,
-    )
-    # Privacy is a source-admission policy, not a post-write label. Validate
-    # it before creating collections/KG state or entering adapter.ingest().
-    config = MempalaceConfig(palace_path=palace_path)
-    overrides = getattr(config, "source_privacy_classes", {})
-    privacy_class = overrides.get(adapter_name, adapter.default_privacy_class)
-    validate_privacy_class(privacy_class)
-    privacy_floor = getattr(config, "privacy_floor", None)
-    if not privacy_class_is_admitted(privacy_class, privacy_floor):
-        from .sources import PrivacyClassRejectedError
 
-        raise PrivacyClassRejectedError(
-            f"adapter {adapter_name!r} privacy class {privacy_class!r} is below "
-            f"palace privacy floor {privacy_floor!r}",
-            privacy_class=privacy_class,
-            privacy_floor=privacy_floor,
-        )
-    # RFC 002 gives adapters first say on routing.  The current item may
-    # replace this default with SourceItemMetadata.route_hint; DrawerRecord
-    # route hints then overlay it per drawer.
-    from .sources import RouteHint
+    try:
+        session = adapter_session(adapter_name)
+        adapter = session.__enter__()
+    except KeyError as exc:
+        raise UnknownSourceAdapterError(
+            f"unknown source adapter {adapter_name!r}; install its adapter package or "
+            "check the adapter name with `mempalace mine --help`"
+        ) from exc
 
-    default_route = RouteHint(
-        wing=source.options.get("wing") or "default",
-        room=source.options.get("room") or "general",
-        hall=source.options.get("hall") or "general",
-    )
-
-    def run() -> int:
-        # A dry run must not create a collection, SQLite database, or lock
-        # file. The facade remains safe even for adapters that bypass its
-        # upsert helper and touch drawer_collection directly.
-        if dry_run:
-            collection = _DryRunCollection()
-            knowledge_graph = _DryRunKnowledgeGraph()
-        else:
-            from .knowledge_graph import KnowledgeGraph
-            from .palace import get_collection
-
-            collection = get_collection(palace_path)
-            knowledge_graph = KnowledgeGraph(
-                db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
+    try:
+        # The registration key, not mutable adapter output, is the persisted
+        # namespace. This prevents one registration from replacing another's
+        # drawers. The lease also prevents a registry replacement from closing
+        # the instance while this mine is using it.
+        if not isinstance(adapter.name, str) or adapter.name != adapter_name:
+            raise SourceAdapterProtocolError(
+                f"registered adapter {adapter_name!r} must declare matching name; got {adapter.name!r}"
             )
+        if not isinstance(adapter.adapter_version, str) or not adapter.adapter_version:
+            raise SourceAdapterProtocolError("adapter_version must be a non-empty string")
+        schema = adapter.describe_schema()
+        validate_adapter_schema(schema)
+        source = SourceRef(
+            uri=source_path if source_is_uri else None,
+            local_path=None if source_is_uri else str(Path(source_path).expanduser().resolve()),
+            options=source_options,
+        )
+        config = MempalaceConfig(palace_path=palace_path)
+        overrides = getattr(config, "source_privacy_classes", {})
+        privacy_class = overrides.get(adapter_name, adapter.default_privacy_class)
+        validate_privacy_class(privacy_class)
+        privacy_floor = getattr(config, "privacy_floor", None)
+        if not privacy_class_is_admitted(privacy_class, privacy_floor):
+            from .sources import PrivacyClassRejectedError
 
-        try:
-            context = PalaceContext(
-                drawer_collection=collection,
-                knowledge_graph=knowledge_graph,
-                palace_path=palace_path,
-                config=config,
-                adapter_name=adapter_name,
-                adapter_version=adapter.adapter_version,
-                added_by=agent,
+            raise PrivacyClassRejectedError(
+                f"adapter {adapter_name!r} privacy class {privacy_class!r} is below "
+                f"palace privacy floor {privacy_floor!r}",
                 privacy_class=privacy_class,
-                default_route_hint=default_route,
-                dry_run=dry_run,
+                privacy_floor=privacy_floor,
             )
-            drawers_written = 0
-            current_item = None
-            replaced_source_items = set()
-            for result in adapter.ingest(source=source, palace=context):
-                if isinstance(result, SourceItemMetadata):
-                    if not result.source_file or not isinstance(result.source_file, str):
-                        raise SourceAdapterProtocolError(
-                            "SourceItemMetadata.source_file must be a non-empty string"
-                        )
-                    if not isinstance(result.version, str):
-                        raise SourceAdapterProtocolError(
-                            "SourceItemMetadata.version must be a string"
-                        )
-                    validate_route_hint(result.route_hint)
-                    current_item = result
-                    context.default_route_hint = result.route_hint or default_route
-                    context._skip_requested = False
-                    if result.version == "__deleted__":
-                        context.delete_source_item(result.source_file)
-                        replaced_source_items.add(result.source_file)
-                        context.skip_current_item()
-                        continue
-                    existing = context.existing_metadata(result.source_file)
-                    if adapter.is_current(item=result, existing_metadata=existing):
-                        context.skip_current_item()
-                    elif result.source_file not in replaced_source_items:
-                        # A changed item can shrink from N chunks to M chunks.
-                        # Replace it as a unit rather than upserting M records
-                        # and leaving stale chunks N..M behind.
-                        context.replace_source_item(result.source_file)
-                        replaced_source_items.add(result.source_file)
-                    continue
-                if not isinstance(result, DrawerRecord):
-                    raise SourceAdapterProtocolError(
-                        "ingest() yielded an unsupported result; expected "
-                        "SourceItemMetadata or DrawerRecord"
-                    )
-                if (
-                    not isinstance(result.content, str)
-                    or not isinstance(result.source_file, str)
-                    or not result.source_file
-                ):
-                    raise SourceAdapterProtocolError(
-                        "DrawerRecord.content must be a string and source_file must be a non-empty string"
-                    )
-                if type(result.chunk_index) is not int:
-                    raise SourceAdapterProtocolError("DrawerRecord.chunk_index must be an int")
-                validate_route_hint(result.route_hint)
-                validate_drawer_metadata(result.metadata, schema)
-                # A skip applies only to the currently announced source item;
-                # adapters may freely interleave drawers for other items.
-                if (
-                    current_item is not None
-                    and context._skip_requested
-                    and (result.source_file == current_item.source_file)
-                ):
-                    continue
-                if result.source_file not in replaced_source_items:
-                    # Eager adapters are not required to announce metadata.
-                    # They still need replacement semantics so an item whose
-                    # chunk count drops cannot retain stale old drawers.
-                    context.replace_source_item(result.source_file)
-                    replaced_source_items.add(result.source_file)
-                drawers_written += 1
-                context.upsert_drawer(result)
-            return drawers_written
-        finally:
-            if not dry_run:
-                knowledge_graph.close()
 
-    # Legacy miners already acquire this palace-wide lock themselves. Adapter
-    # writes need the same lifecycle; daemon jobs call this function too.
-    if dry_run:
-        return run()
-    with mine_palace_lock(palace_path):
-        return run()
+        default_route = RouteHint(
+            wing=source.options.get("wing", "default"),
+            room=source.options.get("room", "general"),
+            hall=source.options.get("hall", "general"),
+        )
+        validate_route_hint(default_route)
+
+        def run() -> int:
+            if dry_run:
+                collection = _DryRunCollection()
+                knowledge_graph = _DryRunKnowledgeGraph()
+            else:
+                from .knowledge_graph import KnowledgeGraph
+                from .palace import get_collection
+
+                collection = get_collection(palace_path)
+                knowledge_graph = KnowledgeGraph(
+                    db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
+                )
+
+            try:
+                # No adapter-visible write reaches storage during extraction.
+                # The constrained collection facade additionally prevents a
+                # third-party adapter from bypassing this staging boundary.
+                context = PalaceContext(
+                    drawer_collection=collection,
+                    knowledge_graph=knowledge_graph,
+                    palace_path=palace_path,
+                    config=config,
+                    adapter_name=adapter_name,
+                    adapter_version=adapter.adapter_version,
+                    added_by=agent,
+                    privacy_class=privacy_class,
+                    default_route_hint=default_route,
+                    dry_run=dry_run,
+                    staging=True,
+                )
+                states: dict[str, dict] = {}
+                staged_by_source: dict[str, list[DrawerRecord]] = {}
+
+                def state_for(source_file: str) -> dict:
+                    return states.setdefault(
+                        source_file,
+                        {
+                            "skip": False,
+                            "tombstone": False,
+                            "reconcile": False,
+                            "route": default_route,
+                        },
+                    )
+
+                def stage_record(record: DrawerRecord) -> None:
+                    if (
+                        not isinstance(record.content, str)
+                        or not isinstance(record.source_file, str)
+                        or not record.source_file
+                    ):
+                        raise SourceAdapterProtocolError(
+                            "DrawerRecord.content must be a string and source_file must be a non-empty string"
+                        )
+                    if type(record.chunk_index) is not int:
+                        raise SourceAdapterProtocolError("DrawerRecord.chunk_index must be an int")
+                    validate_route_hint(record.route_hint)
+                    validate_drawer_metadata(record.metadata, schema)
+                    state = state_for(record.source_file)
+                    if state["skip"] or state["tombstone"]:
+                        return
+                    item_route = state["route"]
+                    effective_route = RouteHint(
+                        wing=(record.route_hint.wing if record.route_hint and record.route_hint.wing is not None else item_route.wing),
+                        room=(record.route_hint.room if record.route_hint and record.route_hint.room is not None else item_route.room),
+                        hall=(record.route_hint.hall if record.route_hint and record.route_hint.hall is not None else item_route.hall),
+                    )
+                    validate_route_hint(effective_route)
+                    state["reconcile"] = True  # eager adapters have no item metadata
+                    staged_by_source.setdefault(record.source_file, []).append(
+                        replace(record, route_hint=effective_route)
+                    )
+
+                for result in adapter.ingest(source=source, palace=context):
+                    if isinstance(result, SourceItemMetadata):
+                        if not result.source_file or not isinstance(result.source_file, str):
+                            raise SourceAdapterProtocolError(
+                                "SourceItemMetadata.source_file must be a non-empty string"
+                            )
+                        if not isinstance(result.version, str):
+                            raise SourceAdapterProtocolError(
+                                "SourceItemMetadata.version must be a string"
+                            )
+                        validate_route_hint(result.route_hint)
+                        state = state_for(result.source_file)
+                        state["route"] = result.route_hint or default_route
+                        context.default_route_hint = state["route"]
+                        context._skip_requested = False
+                        if result.version == "__deleted__":
+                            state["tombstone"] = True
+                            state["skip"] = True
+                            state["reconcile"] = True
+                            context.skip_current_item()
+                            continue
+                        existing = context.existing_metadata(result.source_file)
+                        state["skip"] = bool(adapter.is_current(item=result, existing_metadata=existing))
+                        state["reconcile"] = not state["skip"]
+                        if state["skip"]:
+                            context.skip_current_item()
+                        continue
+                    if not isinstance(result, DrawerRecord):
+                        raise SourceAdapterProtocolError(
+                            "ingest() yielded an unsupported result; expected "
+                            "SourceItemMetadata or DrawerRecord"
+                        )
+                    stage_record(result)
+
+                # ``upsert_drawer`` remains a supported facade method, but in
+                # this run it only staged helper writes. Validate and reconcile
+                # them with yielded records after ingest succeeds as well.
+                helper_drawers, helper_deletes = context.drain_staged_mutations()
+                for record in helper_drawers:
+                    stage_record(record)
+                for source_file in helper_deletes:
+                    if not isinstance(source_file, str) or not source_file:
+                        raise SourceAdapterProtocolError("source_file must be a non-empty string")
+                    state = state_for(source_file)
+                    state["tombstone"] = True
+                    state["skip"] = True
+                    state["reconcile"] = True
+
+                # Phase 2: all protocol/schema/route checks have succeeded.
+                # Only now can stale source drawers be replaced or removed.
+                context.staging = False
+                context.default_route_hint = default_route
+                for source_file, state in states.items():
+                    if state["reconcile"]:
+                        context.delete_source_item(source_file)
+                drawers_written = 0
+                for source_file, records in staged_by_source.items():
+                    state = states[source_file]
+                    if state["skip"] or state["tombstone"]:
+                        continue
+                    for record in records:
+                        context.upsert_drawer(record)
+                        drawers_written += 1
+                return drawers_written
+            finally:
+                if not dry_run:
+                    knowledge_graph.close()
+
+        if dry_run:
+            return run()
+        with mine_palace_lock(palace_path):
+            return run()
+    finally:
+        session.__exit__(*sys.exc_info())
 
 
 class _DryRunCollection:
@@ -962,18 +1000,19 @@ def _parse_source_options(raw_options) -> dict:
         key, value = raw.split("=", 1)
         if not key:
             raise argparse.ArgumentTypeError("--source-option key must not be empty")
-        # Keep secret-bearing values out of argv, shell history, and process
-        # inspection. Adapter credentials belong in MEMPALACE_SOURCE_* env.
-        try:
-            from .sources import SourceAdapterProtocolError, validate_source_options
-
-            validate_source_options({key: value})
-        except SourceAdapterProtocolError as exc:
-            raise argparse.ArgumentTypeError(str(exc)) from exc
         try:
             options[key] = json.loads(value)
         except json.JSONDecodeError:
             options[key] = value
+        # Keep secret-bearing values out of argv, shell history, and process
+        # inspection. Validate the decoded value too: JSON object strings can
+        # otherwise hide nested Authorization/token fields.
+        try:
+            from .sources import SourceAdapterProtocolError, validate_source_options
+
+            validate_source_options(options)
+        except SourceAdapterProtocolError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
     return options
 
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import atexit
+from contextlib import contextmanager
 from importlib import metadata
 from threading import Lock
 from typing import Type
@@ -37,6 +38,8 @@ _instances: dict[str, BaseSourceAdapter] = {}
 _explicit: set[str] = set()
 _discovered = False
 _lock = Lock()
+_leases: dict[int, int] = {}
+_retired: dict[int, tuple[BaseSourceAdapter, str]] = {}
 
 
 def _close_instance(inst: BaseSourceAdapter, *, action: str) -> None:
@@ -45,6 +48,19 @@ def _close_instance(inst: BaseSourceAdapter, *, action: str) -> None:
         inst.close()
     except Exception:
         logger.exception("error closing adapter during %s", action)
+
+
+def _retire_instance(inst: BaseSourceAdapter | None, *, action: str) -> None:
+    """Close an idle cached instance, or defer close until active use ends."""
+    if inst is None:
+        return
+    with _lock:
+        instance_id = id(inst)
+        if _leases.get(instance_id, 0):
+            _retired[instance_id] = (inst, action)
+            return
+        _leases.pop(instance_id, None)
+    _close_instance(inst, action=action)
 
 
 def register(name: str, adapter_cls: Type[BaseSourceAdapter]) -> None:
@@ -56,8 +72,7 @@ def register(name: str, adapter_cls: Type[BaseSourceAdapter]) -> None:
         _registry[name] = adapter_cls
         _explicit.add(name)
         replaced = _instances.pop(name, None)
-    if replaced is not None:
-        _close_instance(replaced, action="replacement")
+    _retire_instance(replaced, action="replacement")
 
 
 def unregister(name: str) -> None:
@@ -66,8 +81,7 @@ def unregister(name: str) -> None:
         _registry.pop(name, None)
         _explicit.discard(name)
         removed = _instances.pop(name, None)
-    if removed is not None:
-        _close_instance(removed, action="unregister")
+    _retire_instance(removed, action="unregister")
 
 
 def _discover_entry_points() -> None:
@@ -142,13 +156,51 @@ def get_adapter(name: str) -> BaseSourceAdapter:
         return inst
 
 
+@contextmanager
+def adapter_session(name: str):
+    """Lease an adapter instance so registry mutation cannot close it mid-mine.
+
+    ``get_adapter`` remains backward compatible for callers that only need an
+    instance.  Core ingestion uses this context manager, which makes a
+    concurrent register/unregister/reset defer ``close()`` until the active
+    operation finishes.
+    """
+    _discover_entry_points()
+    with _lock:
+        inst = _instances.get(name)
+        if inst is None:
+            cls = _registry.get(name)
+            if cls is None:
+                raise KeyError(
+                    f"unknown source adapter {name!r}; available: {sorted(_registry.keys())}"
+                )
+            inst = cls()
+            _instances[name] = inst
+        instance_id = id(inst)
+        _leases[instance_id] = _leases.get(instance_id, 0) + 1
+    try:
+        yield inst
+    finally:
+        retired = None
+        with _lock:
+            instance_id = id(inst)
+            remaining = _leases.get(instance_id, 0) - 1
+            if remaining > 0:
+                _leases[instance_id] = remaining
+            else:
+                _leases.pop(instance_id, None)
+                retired = _retired.pop(instance_id, None)
+        if retired is not None:
+            _close_instance(retired[0], action=retired[1])
+
+
 def reset_adapters() -> None:
     """Close and drop all cached adapter instances (primarily for tests)."""
     with _lock:
         instances = list(_instances.values())
         _instances.clear()
     for inst in instances:
-        _close_instance(inst, action="reset")
+        _retire_instance(inst, action="reset")
 
 
 # Long-lived adapters may own sockets, pools, or SQLite connections.  Normal

@@ -131,7 +131,10 @@ def test_cmd_mine_source_dispatches_registered_adapter_through_palace_context(mo
     assert adapter.palace.palace_path == "/fake/palace"
     assert adapter.palace.adapter_name == "fixture"
     assert adapter.palace.adapter_version == "0.1.0"
-    assert adapter.palace.drawer_collection is collection
+    # Adapters receive a constrained read-only collection facade; only core
+    # retains the raw backend so they cannot bypass staged reconciliation.
+    assert adapter.palace.drawer_collection is not collection
+    assert adapter.palace.drawer_collection.get(where={}) == {"metadatas": []}
     assert adapter.palace.knowledge_graph is _FakeKnowledgeGraph.instances[0]
     assert _FakeKnowledgeGraph.instances[0].closed is True
     assert collection.upserts[0]["documents"] == ["fixture content"]
@@ -380,9 +383,8 @@ def test_adapter_dry_run_never_initializes_writable_storage_or_kg(monkeypatch):
         name = "dry-run"
 
         def ingest(self, *, source, palace):
-            # Direct facade access is still side-effect-free, not merely core's
-            # normal ``upsert_drawer`` call.
-            palace.drawer_collection.upsert(documents=["x"])
+            # The supported facade methods remain side-effect-free in dry run.
+            palace.upsert_drawer(DrawerRecord(content="helper preview", source_file="fixture://helper"))
             palace.knowledge_graph.add_triple("a", "b", "c")
             yield DrawerRecord(content="preview", source_file="fixture://preview")
 
@@ -404,7 +406,7 @@ def test_adapter_dry_run_never_initializes_writable_storage_or_kg(monkeypatch):
         cli.mine_source_adapter(
             source_name="dry-run", source_path="/source", palace_path="/fake/palace", dry_run=True
         )
-        == 1
+        == 2
     )
 
 
@@ -656,3 +658,144 @@ def test_daemon_maps_adapter_errors_like_cli(monkeypatch):
     invalid = service.run_mine({"source": "x", "source_adapter": "fixture", "palace_path": "/fake"})
     assert invalid["error_class"] == "SchemaConformanceError"
     assert invalid["exit_code"] == 1
+
+
+def test_interleaved_source_items_keep_independent_skip_replace_and_route_state(monkeypatch):
+    class InterleavedAdapter(BaseSourceAdapter):
+        name = "interleaved"
+
+        def ingest(self, *, source, palace):
+            yield SourceItemMetadata(
+                source_file="item://replace", version="new", route_hint=RouteHint(wing="replace")
+            )
+            yield SourceItemMetadata(
+                source_file="item://skip", version="same", route_hint=RouteHint(wing="skip")
+            )
+            # A's drawer arrives after B's metadata; a single current-item
+            # flag used to incorrectly apply B's skip/route to this record.
+            yield DrawerRecord(content="replace", source_file="item://replace")
+            yield DrawerRecord(content="skip", source_file="item://skip")
+
+        def is_current(self, *, item, existing_metadata):
+            return item.version == "same"
+
+        def describe_schema(self):
+            return AdapterSchema(version="1.0", fields={})
+
+    collection = _FakeCollection()
+    collection.existing_metadata = {"version": "old"}
+    _install_normal_storage(monkeypatch, collection)
+    register("interleaved", InterleavedAdapter)
+
+    assert cli.mine_source_adapter(source_name="interleaved", source_path="/source", palace_path="/fake") == 1
+    assert collection.upserts[0]["documents"] == ["replace"]
+    assert collection.upserts[0]["metadatas"][0]["wing"] == "replace"
+    assert collection.deletes == [
+        {"where": {"$and": [{"source_file": "item://replace"}, {"adapter_name": "interleaved"}]}}
+    ]
+
+
+@pytest.mark.parametrize("failure", ["malformed", "exception"])
+def test_adapter_reconciliation_stages_all_output_before_replacing_existing_drawers(monkeypatch, failure):
+    class FailingAdapter(BaseSourceAdapter):
+        name = "staged-failure"
+
+        def ingest(self, *, source, palace):
+            yield SourceItemMetadata(source_file="item://old", version="new")
+            yield DrawerRecord(content="good", source_file="item://old")
+            if failure == "malformed":
+                yield DrawerRecord(content="bad", source_file="item://old", metadata={"undeclared": "x"})
+            raise RuntimeError("adapter transport failed")
+
+        def describe_schema(self):
+            return AdapterSchema(version="1.0", fields={})
+
+    collection = _FakeCollection()
+    collection.existing_metadata = {"version": "old"}
+    _install_normal_storage(monkeypatch, collection)
+    register("staged-failure", FailingAdapter)
+
+    expected = SchemaConformanceError if failure == "malformed" else RuntimeError
+    with pytest.raises(expected):
+        cli.mine_source_adapter(source_name="staged-failure", source_path="/source", palace_path="/fake")
+    # The previous source item remains untouched: no early delete, no partial replacement.
+    assert collection.deletes == []
+    assert collection.upserts == []
+
+
+def test_adapter_rejects_invalid_default_and_merged_routes_before_storage_mutation(monkeypatch):
+    class InvalidRouteAdapter(BaseSourceAdapter):
+        name = "invalid-route"
+
+        def ingest(self, *, source, palace):
+            yield SourceItemMetadata(source_file="item://route", version="new")
+            yield DrawerRecord(
+                content="bad route", source_file="item://route", route_hint=RouteHint(room="")
+            )
+
+        def describe_schema(self):
+            return AdapterSchema(version="1.0", fields={})
+
+    collection = _FakeCollection()
+    _install_normal_storage(monkeypatch, collection)
+    register("invalid-route", InvalidRouteAdapter)
+    with pytest.raises(SourceAdapterProtocolError, match="route_hint.room"):
+        cli.mine_source_adapter(source_name="invalid-route", source_path="/source", palace_path="/fake")
+    assert collection.deletes == []
+    assert collection.upserts == []
+
+    with pytest.raises(SourceAdapterProtocolError, match="route_hint.wing"):
+        cli.mine_source_adapter(
+            source_name="invalid-route",
+            source_path="/source",
+            palace_path="/fake",
+            source_options={"wing": 3},
+        )
+
+
+def test_adapter_collection_facade_blocks_raw_write_bypass(monkeypatch):
+    class BypassAdapter(BaseSourceAdapter):
+        name = "bypass"
+
+        def ingest(self, *, source, palace):
+            palace.drawer_collection.delete(where={})
+            yield DrawerRecord(content="never", source_file="item://never")
+
+        def describe_schema(self):
+            return AdapterSchema(version="1.0", fields={})
+
+    collection = _FakeCollection()
+    _install_normal_storage(monkeypatch, collection)
+    register("bypass", BypassAdapter)
+    with pytest.raises(SourceAdapterProtocolError, match="raw collection writes"):
+        cli.mine_source_adapter(source_name="bypass", source_path="/source", palace_path="/fake")
+    assert collection.deletes == []
+    assert collection.upserts == []
+
+
+def test_daemon_source_options_and_privacy_rejection_match_source_entrypoints(monkeypatch):
+    from mempalace import service
+
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", os.environ.get("MEMPALACE_PALACE_PATH", ""))
+    monkeypatch.setattr(service, "MempalaceConfig", _FakeConfig)
+    invalid = service.run_mine(
+        {"source": "x", "source_adapter": "fixture", "source_options": [], "palace_path": "/fake"}
+    )
+    assert invalid == {
+        "success": False,
+        "error": "source_options must be an object",
+        "error_class": "SourceAdapterProtocolError",
+        "exit_code": 2,
+    }
+
+    monkeypatch.setattr(
+        cli,
+        "mine_source_adapter",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            PrivacyClassRejectedError("blocked", privacy_class="sensitive", privacy_floor="internal")
+        ),
+    )
+    rejected = service.run_mine({"source": "x", "source_adapter": "fixture", "palace_path": "/fake"})
+    assert rejected["success"] is True
+    assert rejected["exit_code"] == 0
+    assert rejected["rejected"][0]["privacy_class"] == "sensitive"

@@ -167,7 +167,9 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
         if source_adapter:
             from .cli import mine_source_adapter
 
-            source_options = payload.get("source_options") or {}
+            source_options = payload.get("source_options", {})
+            if source_options is None:
+                source_options = {}
             if not isinstance(source_options, dict):
                 return {
                     "success": False,
@@ -255,7 +257,30 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         # Import only on the adapter path so the daemon keeps its lightweight
         # startup behavior for ordinary legacy mine jobs.
-        from .sources import SourceAdapterError, UnknownSourceAdapterError
+        from .sources import (
+            PrivacyClassRejectedError,
+            SourceAdapterError,
+            UnknownSourceAdapterError,
+        )
+
+        # Match the direct CLI/MCP source-admission contract: a privacy-floor
+        # rejection is an intentional no-write result, not a failed daemon job.
+        if isinstance(exc, PrivacyClassRejectedError):
+            return {
+                "success": True,
+                "kind": "mine",
+                "mode": "source",
+                "dry_run": dry_run,
+                "rejected": [
+                    {
+                        "source": source,
+                        "privacy_class": exc.privacy_class,
+                        "privacy_floor": exc.privacy_floor,
+                        "reason": str(exc),
+                    }
+                ],
+                "exit_code": 0,
+            }
 
         if isinstance(exc, UnknownSourceAdapterError):
             return {
