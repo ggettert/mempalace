@@ -20,6 +20,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import json
+import re
 from typing import TYPE_CHECKING, ClassVar, Iterator, Literal, Optional
 
 if TYPE_CHECKING:
@@ -67,6 +68,15 @@ class TransformationViolationError(SourceAdapterError):
 class SchemaConformanceError(SourceAdapterError):
     """Raised when a ``DrawerRecord.metadata`` violates the adapter schema
     returned by :meth:`BaseSourceAdapter.describe_schema`."""
+
+
+class PrivacyClassRejectedError(SourceAdapterError):
+    """Raised before extraction when a source is below the palace privacy floor."""
+
+    def __init__(self, message: str, *, privacy_class: str | None = None, privacy_floor: str | None = None):
+        super().__init__(message)
+        self.privacy_class = privacy_class
+        self.privacy_floor = privacy_floor
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +172,73 @@ class AdapterSchema:
 
 
 _METADATA_SCALAR_TYPES = (str, int, float, bool)
+
+# Ordered from least to most restricted.  A palace floor admits its own level
+# and every level to its left (RFC 002 §6.2).
+PRIVACY_CLASSES = (
+    "public",
+    "internal",
+    "pii_potential",
+    "sensitive",
+    "secrets_possible",
+)
+
+# ``SourceRef.options`` is deliberately non-secret.  CLI options are visible
+# in shell history and process argv, but rejecting these names at the shared
+# boundary also keeps daemon/MCP callers from accidentally normalizing secret
+# passing as an adapter API.
+_SECRET_OPTION_KEY_RE = re.compile(
+    r"(?:^|[_-])(?:api[_-]?key|auth(?:orization)?|credential|password|passwd|secret|token|private[_-]?key)(?:$|[_-])",
+    re.IGNORECASE,
+)
+
+
+def validate_source_options(options: dict) -> None:
+    """Reject malformed or secret-like adapter option keys before ingestion."""
+    if not isinstance(options, dict):
+        raise SourceAdapterProtocolError("source_options must be a dict")
+    for key in options:
+        if not isinstance(key, str) or not key:
+            raise SourceAdapterProtocolError("source option keys must be non-empty strings")
+        # Also catch compact spellings such as ``apiKey`` and ``accessToken``.
+        normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+        if _SECRET_OPTION_KEY_RE.search(key) or any(
+            marker in normalized
+            for marker in ("apikey", "authtoken", "accesstoken", "credential", "password", "passwd", "secret", "token", "privatekey")
+        ):
+            raise SourceAdapterProtocolError(
+                f"source option {key!r} looks secret-like; provide credentials through environment variables"
+            )
+
+
+def validate_privacy_class(value: str, *, field_name: str = "privacy_class") -> str:
+    if not isinstance(value, str) or value not in PRIVACY_CLASSES:
+        allowed = ", ".join(PRIVACY_CLASSES)
+        raise SourceAdapterProtocolError(f"{field_name} must be one of: {allowed}")
+    return value
+
+
+def privacy_class_is_admitted(privacy_class: str, privacy_floor: str | None) -> bool:
+    """Return whether ``privacy_class`` is admitted by an optional floor."""
+    validate_privacy_class(privacy_class)
+    if privacy_floor is None:
+        return True
+    validate_privacy_class(privacy_floor, field_name="privacy_floor")
+    return PRIVACY_CLASSES.index(privacy_class) <= PRIVACY_CLASSES.index(privacy_floor)
+
+
+def validate_route_hint(route_hint: RouteHint | None) -> None:
+    """Validate the flat routing surface adapters are allowed to provide."""
+    if route_hint is None:
+        return
+    if not isinstance(route_hint, RouteHint):
+        raise SourceAdapterProtocolError("route_hint must be a RouteHint or None")
+    for field_name in ("wing", "room", "hall"):
+        value = getattr(route_hint, field_name)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise SourceAdapterProtocolError(
+                f"route_hint.{field_name} must be a non-empty string or None"
+            )
 
 
 def validate_adapter_schema(schema: AdapterSchema) -> None:

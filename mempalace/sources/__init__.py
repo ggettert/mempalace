@@ -26,6 +26,8 @@ from .base import (
     IngestMode,
     IngestResult,
     RouteHint,
+    PRIVACY_CLASSES,
+    PrivacyClassRejectedError,
     SchemaConformanceError,
     SourceAdapterError,
     SourceAdapterProtocolError,
@@ -37,6 +39,10 @@ from .base import (
     UnknownSourceAdapterError,
     validate_adapter_schema,
     validate_drawer_metadata,
+    validate_privacy_class,
+    validate_route_hint,
+    validate_source_options,
+    privacy_class_is_admitted,
 )
 from .context import PalaceContext, ProgressHook
 from .registry import (
@@ -61,6 +67,8 @@ __all__ = [
     "PalaceContext",
     "ProgressHook",
     "RouteHint",
+    "PRIVACY_CLASSES",
+    "PrivacyClassRejectedError",
     "SchemaConformanceError",
     "SourceAdapterError",
     "SourceAdapterProtocolError",
@@ -79,4 +87,8 @@ __all__ = [
     "unregister",
     "validate_adapter_schema",
     "validate_drawer_metadata",
+    "validate_privacy_class",
+    "validate_route_hint",
+    "validate_source_options",
+    "privacy_class_is_admitted",
 ]

@@ -42,6 +42,41 @@ def test_registered_in_tools():
     assert entry["input_schema"]["required"] == ["source"]
 
 
+def test_mcp_source_adapter_dispatches_uri_through_cli_route(monkeypatch, config):
+    """RFC adapters are available to MCP callers, not only the shell CLI."""
+    from mempalace import cli, mcp_server
+
+    _patch(monkeypatch, config)
+    captured = {}
+    monkeypatch.setattr(
+        cli,
+        "mine_source_adapter",
+        lambda **kwargs: captured.update(kwargs) or 1,
+    )
+
+    result = mcp_server.tool_mine(
+        source="slack://workspace/channel",
+        source_adapter="slack",
+        source_uri=True,
+        source_options={"limit": 5},
+        wing="engineering",
+        agent="kit",
+        dry_run=True,
+    )
+
+    assert result["success"] is True
+    assert result["mode"] == "source"
+    assert captured == {
+        "source_name": "slack",
+        "source_path": "slack://workspace/channel",
+        "palace_path": config.palace_path,
+        "dry_run": True,
+        "source_is_uri": True,
+        "source_options": {"limit": 5, "wing": "engineering"},
+        "agent": "kit",
+    }
+
+
 # ── Guard rails ──────────────────────────────────────────────────────────
 
 

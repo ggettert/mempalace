@@ -16,6 +16,8 @@ from mempalace.sources import (
     SchemaConformanceError,
     SourceAdapterProtocolError,
     SourceItemMetadata,
+    RouteHint,
+    PrivacyClassRejectedError,
     UnknownSourceAdapterError,
     get_adapter,
     register,
@@ -470,6 +472,121 @@ def test_cli_forwards_uri_and_generic_options_to_adapter(monkeypatch):
     assert source.local_path is None
     assert source.uri == "slack://workspace/channel"
     assert source.options == {"limit": 3, "label": "eng"}
+
+
+def test_cli_rejects_secret_like_source_option_before_adapter_invocation(monkeypatch, capsys):
+    collection = _FakeCollection()
+    _install_normal_storage(monkeypatch, collection)
+    register("fixture", _FixtureAdapter)
+    args = _mine_args(source="fixture")
+    args.source_option = ["api_token=do-not-put-this-in-argv"]
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.cmd_mine(args)
+
+    assert excinfo.value.code == 2
+    assert "looks secret-like" in capsys.readouterr().err
+    assert _FixtureAdapter.instances == []
+
+
+def test_adapter_identity_must_match_registered_namespace_before_ingest(monkeypatch):
+    collection = _FakeCollection()
+    _install_normal_storage(monkeypatch, collection)
+    # The same class registered under an alias must not be able to use its
+    # declared name to read/delete drawers from the other namespace.
+    register("fixture-alias", _FixtureAdapter)
+
+    with pytest.raises(SourceAdapterProtocolError, match="must declare matching name"):
+        cli.mine_source_adapter(
+            source_name="fixture-alias", source_path="/source", palace_path="/fake/palace"
+        )
+
+    assert collection.upserts == []
+    assert collection.deletes == []
+
+
+def test_adapter_privacy_floor_rejects_before_ingest_and_writes(monkeypatch):
+    class RestrictedAdapter(_FixtureAdapter):
+        name = "restricted"
+        default_privacy_class = "pii_potential"
+        called = False
+
+        def ingest(self, *, source, palace):
+            self.__class__.called = True
+            yield from super().ingest(source=source, palace=palace)
+
+    class StrictConfig(_FakeConfig):
+        privacy_floor = "internal"
+        source_privacy_classes = {}
+
+    collection = _FakeCollection()
+    _install_normal_storage(monkeypatch, collection)
+    monkeypatch.setattr(cli, "MempalaceConfig", StrictConfig)
+    from mempalace import palace
+
+    monkeypatch.setattr(
+        palace,
+        "get_collection",
+        lambda _path: pytest.fail("privacy-rejected source must not initialize storage"),
+    )
+    register("restricted", RestrictedAdapter)
+
+    with pytest.raises(PrivacyClassRejectedError) as excinfo:
+        cli.mine_source_adapter(
+            source_name="restricted", source_path="/source", palace_path="/fake/palace"
+        )
+
+    assert excinfo.value.privacy_class == "pii_potential"
+    assert excinfo.value.privacy_floor == "internal"
+    assert RestrictedAdapter.called is False
+    assert collection.upserts == []
+    assert collection.deletes == []
+
+
+def test_adapter_persists_universal_metadata_and_route_hints(monkeypatch):
+    class RoutedAdapter(BaseSourceAdapter):
+        name = "routed"
+        adapter_version = "7.2.0"
+        default_privacy_class = "internal"
+
+        def ingest(self, *, source, palace):
+            yield SourceItemMetadata(
+                source_file="routed://item",
+                version="v1",
+                route_hint=RouteHint(wing="item-wing", room="item-room", hall="item-hall"),
+            )
+            yield DrawerRecord(
+                content="routed",
+                source_file="routed://item",
+                metadata={"privacy_class": "public", "added_by": "forged"},
+                route_hint=RouteHint(room="drawer-room"),
+            )
+
+        def describe_schema(self):
+            return AdapterSchema(version="1.0", fields={})
+
+    collection = _FakeCollection()
+    _install_normal_storage(monkeypatch, collection)
+    register("routed", RoutedAdapter)
+
+    cli.mine_source_adapter(
+        source_name="routed",
+        source_path="/source",
+        palace_path="/fake/palace",
+        agent="kit",
+    )
+
+    metadata = collection.upserts[0]["metadatas"][0]
+    assert metadata["adapter_name"] == "routed"
+    assert metadata["adapter_version"] == "7.2.0"
+    assert metadata["privacy_class"] == "internal"
+    assert metadata["added_by"] == "kit"
+    assert metadata["source_file"] == "routed://item"
+    assert metadata["chunk_index"] == 0
+    assert metadata["wing"] == "item-wing"
+    assert metadata["room"] == "drawer-room"
+    assert metadata["hall"] == "item-hall"
+    assert metadata["filed_at"]
 
 
 def test_cli_normalizes_local_adapter_paths_but_leaves_uris_verbatim(monkeypatch, tmp_path):

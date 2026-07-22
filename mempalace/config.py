@@ -579,6 +579,22 @@ class MempalaceConfig:
         """Mapping of hall names to keyword lists."""
         return self._file_config.get("hall_keywords", DEFAULT_HALL_KEYWORDS)
 
+    @property
+    def privacy_floor(self):
+        """Maximum sensitivity admitted for source-adapter ingestion.
+
+        ``None`` preserves the RFC 002 single-user default of admitting every
+        privacy class. Validation is performed at the ingest boundary so an
+        invalid policy cannot be silently treated as permissive.
+        """
+        return self._file_config.get("privacy_floor")
+
+    @property
+    def source_privacy_classes(self):
+        """Optional per-adapter privacy-class overrides keyed by adapter name."""
+        value = self._file_config.get("source_privacy_classes", {})
+        return value if isinstance(value, dict) else {}
+
     @staticmethod
     def _try_coerce_int(value, minimum=None):
         """Coerce a raw config value to int, or ``None`` if it cannot be a

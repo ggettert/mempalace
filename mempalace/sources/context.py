@@ -16,9 +16,10 @@ contract is stable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Protocol
 
-from .base import DrawerRecord
+from .base import DrawerRecord, RouteHint, validate_privacy_class
 
 
 class _CollectionLike(Protocol):
@@ -76,6 +77,9 @@ class PalaceContext:
     config: Optional[Any] = None
     adapter_name: str = ""
     adapter_version: str = ""
+    added_by: str = "mempalace"
+    privacy_class: str = "pii_potential"
+    default_route_hint: Optional[RouteHint] = None
     progress_hooks: list[ProgressHook] = field(default_factory=list)
     dry_run: bool = False
 
@@ -107,6 +111,24 @@ class PalaceContext:
             meta["adapter_name"] = self.adapter_name
         if self.adapter_version:
             meta["adapter_version"] = self.adapter_version
+        # Universal fields are core-owned. This keeps a third-party adapter
+        # from downgrading its privacy class or forging who/routing metadata.
+        meta["privacy_class"] = validate_privacy_class(self.privacy_class)
+        meta["added_by"] = self.added_by
+        meta["filed_at"] = datetime.now(timezone.utc).isoformat()
+        route = _merge_route_hints(self.default_route_hint, record.route_hint)
+        # Older adapters may still carry routing in metadata. Preserve that
+        # established shape when no RFC RouteHint/default was supplied; new
+        # explicit route hints always take precedence.
+        if self.default_route_hint is None and record.route_hint is None:
+            route = RouteHint(
+                wing=meta.get("wing") or route.wing,
+                room=meta.get("room") or route.room,
+                hall=meta.get("hall") or route.hall,
+            )
+        meta["wing"] = route.wing or "default"
+        meta["room"] = route.room or "general"
+        meta["hall"] = route.hall or "general"
         drawer_id = _build_drawer_id(record, adapter_name=self.adapter_name)
         self.drawer_collection.upsert(
             documents=[record.content],
@@ -189,3 +211,14 @@ def _build_drawer_id(record: DrawerRecord, *, adapter_name: str = "") -> str:
         identity = f"{adapter_name}\0{record.source_file}"
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
     return f"{digest}_{record.chunk_index}"
+
+
+def _merge_route_hints(default: Optional[RouteHint], record: Optional[RouteHint]) -> RouteHint:
+    """Overlay a per-drawer hint over the current item/default route."""
+    default = default or RouteHint(wing="default", room="general", hall="general")
+    record = record or RouteHint()
+    return RouteHint(
+        wing=record.wing if record.wing is not None else default.wing,
+        room=record.room if record.room is not None else default.room,
+        hall=record.hall if record.hall is not None else default.hall,
+    )

@@ -2765,13 +2765,16 @@ def _capture_fd_stdout(fn):
 def tool_mine(
     source: str,
     mode: str = "projects",
+    source_adapter: str = None,
+    source_uri: bool = False,
+    source_options: dict = None,
     wing: str = None,
     agent: str = "mempalace",
     limit: int = 0,
     dry_run: bool = False,
     extract: str = "exchange",
 ):
-    """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
+    """Mine a directory or registered source adapter into the palace.
 
     Lets MCP clients that cannot shell out (Claude Desktop, LM Studio, Aionui,
     Desktop Commander) trigger indexing in-conversation (#1662). Wraps the same
@@ -2790,6 +2793,11 @@ def tool_mine(
     dry_run: walk + chunk and report, but file nothing.
     extract: convos extraction strategy — ``"exchange"`` (default) or
              ``"general"``; ignored by the other modes.
+    source_adapter: registered RFC 002 adapter name. When set, ``source`` is
+             passed to that adapter (as a local path unless ``source_uri``).
+    source_uri: pass ``source`` as ``SourceRef.uri`` for ``source_adapter``.
+    source_options: non-secret adapter options. Credentials must be supplied
+             through environment variables, never MCP arguments.
 
     Runs synchronously and mirrors the :func:`tool_sync` contract: success
     returns ``{success: True, mode, dry_run, output[, output_truncated]}`` where ``output`` is
@@ -2813,11 +2821,30 @@ def tool_mine(
             "error": f"invalid mode '{mode}'; expected one of: {', '.join(valid_modes)}",
         }
 
-    src = os.path.expanduser(source) if source else ""
-    if not src or not os.path.isdir(src):
+    src = os.path.expanduser(source) if source and not source_uri else (source or "")
+    if not src:
         return {"success": False, "error": f"source directory not found: {source!r}"}
+    if not source_adapter and not os.path.isdir(src):
+        return {"success": False, "error": f"source directory not found: {source!r}"}
+    if source_options is not None and not isinstance(source_options, dict):
+        return {"success": False, "error": "source_options must be an object", "error_class": "SourceAdapterProtocolError"}
 
     def _run():
+        if source_adapter:
+            from .cli import mine_source_adapter
+
+            options = dict(source_options or {})
+            if wing is not None:
+                options.setdefault("wing", wing)
+            return mine_source_adapter(
+                source_name=source_adapter,
+                source_path=src,
+                palace_path=_config.palace_path,
+                dry_run=dry_run,
+                source_is_uri=source_uri,
+                source_options=options,
+                agent=agent,
+            )
         if mode == "convos":
             from .convo_miner import mine_convos
 
@@ -2885,6 +2912,30 @@ def tool_mine(
             return {"success": False, "error": f"mine failed: {exc}", "error_class": "ImportError"}
         except ValueError as exc:
             return {"success": False, "error": str(exc), "error_class": "ValueError"}
+        except Exception as exc:
+            from .sources import PrivacyClassRejectedError, SourceAdapterError
+
+            if isinstance(exc, PrivacyClassRejectedError):
+                return {
+                    "success": True,
+                    "mode": "source",
+                    "dry_run": dry_run,
+                    "output": "",
+                    "rejected": [{
+                        "source": source,
+                        "privacy_class": exc.privacy_class,
+                        "privacy_floor": exc.privacy_floor,
+                        "reason": str(exc),
+                    }],
+                }
+            if isinstance(exc, SourceAdapterError):
+                return {"success": False, "error": str(exc), "error_class": type(exc).__name__}
+            logger.exception("tool_mine: mine failed (mode=%s)", mode)
+            return {
+                "success": False,
+                "error": f"mine failed: {exc}",
+                "error_class": type(exc).__name__,
+            }
         except SystemExit as exc:
             # A library mine() must never terminate the MCP server. miner.mine
             # converts Ctrl-C into sys.exit(130) (CLI semantics); in-process
@@ -2896,17 +2947,15 @@ def tool_mine(
                 "error": f"mine exited early (code {exc.code})",
                 "error_class": "Interrupted",
             }
-        except Exception as exc:
-            logger.exception("tool_mine: mine failed (mode=%s)", mode)
-            return {
-                "success": False,
-                "error": f"mine failed: {exc}",
-                "error_class": type(exc).__name__,
-            }
         # Cap the echoed summary so a very large mine cannot return a multi-MB
         # payload to the MCP client. The useful summary is at the tail, so keep
         # the end and flag the truncation (never silently).
-        payload = {"success": True, "mode": mode, "dry_run": dry_run, "output": output}
+        payload = {
+            "success": True,
+            "mode": "source" if source_adapter else mode,
+            "dry_run": dry_run,
+            "output": output,
+        }
         cap = 4000
         if len(output) > cap:
             payload["output"] = output[-cap:]
@@ -4423,6 +4472,18 @@ TOOLS = {
                         "Ingest mode: projects (code/docs, default), convos (chat "
                         "transcripts), extract (office docs)."
                     ),
+                },
+                "source_adapter": {
+                    "type": "string",
+                    "description": "Registered RFC 002 source adapter. When set, source may be a URI.",
+                },
+                "source_uri": {
+                    "type": "boolean",
+                    "description": "Pass source to source_adapter as a URI rather than a local path.",
+                },
+                "source_options": {
+                    "type": "object",
+                    "description": "Non-secret adapter options. Supply credentials via environment variables.",
                 },
                 "wing": {
                     "type": "string",

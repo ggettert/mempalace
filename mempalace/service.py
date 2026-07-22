@@ -188,6 +188,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 dry_run=dry_run,
                 source_is_uri=bool(payload.get("source_uri")),
                 source_options=source_options,
+                agent=agent,
             )
         elif mode == "convos":
             from .convo_miner import mine_convos

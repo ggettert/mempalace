@@ -599,7 +599,11 @@ def cmd_mine(args):
 
     if source_adapter:
         from .palace import MineAlreadyRunning
-        from .sources import SourceAdapterError, UnknownSourceAdapterError
+        from .sources import (
+            PrivacyClassRejectedError,
+            SourceAdapterError,
+            UnknownSourceAdapterError,
+        )
 
         try:
             drawers_written = mine_source_adapter(
@@ -609,10 +613,17 @@ def cmd_mine(args):
                 dry_run=args.dry_run,
                 source_is_uri=source_is_uri,
                 source_options=source_options,
+                agent=args.agent,
             )
         except UnknownSourceAdapterError as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(2)
+        except PrivacyClassRejectedError as exc:
+            print(
+                f"  Source adapter {source_adapter!r}: rejected source due to privacy floor "
+                f"({exc.privacy_class!r} > {exc.privacy_floor!r})."
+            )
+            return
         except SourceAdapterError as exc:
             print(f"mempalace: source adapter {source_adapter!r} failed: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -708,6 +719,7 @@ def mine_source_adapter(
     dry_run: bool = False,
     source_is_uri: bool = False,
     source_options: dict | None = None,
+    agent: str = "mempalace",
 ) -> int:
     """Run an explicitly selected RFC 002 source adapter through ``PalaceContext``.
 
@@ -724,9 +736,13 @@ def mine_source_adapter(
         SourceNotFoundError,
         UnknownSourceAdapterError,
         get_adapter,
+        privacy_class_is_admitted,
         resolve_adapter_for_source,
         validate_adapter_schema,
         validate_drawer_metadata,
+        validate_privacy_class,
+        validate_route_hint,
+        validate_source_options,
     )
     from .palace import mine_palace_lock
 
@@ -743,6 +759,19 @@ def mine_source_adapter(
         raise SourceNotFoundError("source reference must be a non-empty string")
     if source_options is not None and not isinstance(source_options, dict):
         raise SourceAdapterProtocolError("source_options must be a dict")
+    source_options = dict(source_options or {})
+    validate_source_options(source_options)
+    if not isinstance(agent, str) or not agent:
+        raise SourceAdapterProtocolError("agent must be a non-empty string")
+    # The registration key, not mutable adapter output, is the persisted
+    # namespace.  This prevents an adapter registered under one identity from
+    # replacing/tombstoning drawers belonging to a differently named adapter.
+    if not isinstance(adapter.name, str) or adapter.name != adapter_name:
+        raise SourceAdapterProtocolError(
+            f"registered adapter {adapter_name!r} must declare matching name; got {adapter.name!r}"
+        )
+    if not isinstance(adapter.adapter_version, str) or not adapter.adapter_version:
+        raise SourceAdapterProtocolError("adapter_version must be a non-empty string")
     # Validate adapter-owned inputs before opening any palace state.  This is
     # especially important for a malformed third-party adapter pointed at a
     # new palace path: it must not leave a freshly-created collection behind.
@@ -754,7 +783,33 @@ def mine_source_adapter(
     source = SourceRef(
         uri=source_path if source_is_uri else None,
         local_path=None if source_is_uri else str(Path(source_path).expanduser().resolve()),
-        options=dict(source_options or {}),
+        options=source_options,
+    )
+    # Privacy is a source-admission policy, not a post-write label. Validate
+    # it before creating collections/KG state or entering adapter.ingest().
+    config = MempalaceConfig(palace_path=palace_path)
+    overrides = getattr(config, "source_privacy_classes", {})
+    privacy_class = overrides.get(adapter_name, adapter.default_privacy_class)
+    validate_privacy_class(privacy_class)
+    privacy_floor = getattr(config, "privacy_floor", None)
+    if not privacy_class_is_admitted(privacy_class, privacy_floor):
+        from .sources import PrivacyClassRejectedError
+
+        raise PrivacyClassRejectedError(
+            f"adapter {adapter_name!r} privacy class {privacy_class!r} is below "
+            f"palace privacy floor {privacy_floor!r}",
+            privacy_class=privacy_class,
+            privacy_floor=privacy_floor,
+        )
+    # RFC 002 gives adapters first say on routing.  The current item may
+    # replace this default with SourceItemMetadata.route_hint; DrawerRecord
+    # route hints then overlay it per drawer.
+    from .sources import RouteHint
+
+    default_route = RouteHint(
+        wing=source.options.get("wing") or "default",
+        room=source.options.get("room") or "general",
+        hall=source.options.get("hall") or "general",
     )
 
     def run() -> int:
@@ -778,9 +833,12 @@ def mine_source_adapter(
                 drawer_collection=collection,
                 knowledge_graph=knowledge_graph,
                 palace_path=palace_path,
-                config=MempalaceConfig(palace_path=palace_path),
-                adapter_name=adapter.name,
+                config=config,
+                adapter_name=adapter_name,
                 adapter_version=adapter.adapter_version,
+                added_by=agent,
+                privacy_class=privacy_class,
+                default_route_hint=default_route,
                 dry_run=dry_run,
             )
             drawers_written = 0
@@ -796,7 +854,9 @@ def mine_source_adapter(
                         raise SourceAdapterProtocolError(
                             "SourceItemMetadata.version must be a string"
                         )
+                    validate_route_hint(result.route_hint)
                     current_item = result
+                    context.default_route_hint = result.route_hint or default_route
                     context._skip_requested = False
                     if result.version == "__deleted__":
                         context.delete_source_item(result.source_file)
@@ -828,6 +888,7 @@ def mine_source_adapter(
                     )
                 if type(result.chunk_index) is not int:
                     raise SourceAdapterProtocolError("DrawerRecord.chunk_index must be an int")
+                validate_route_hint(result.route_hint)
                 validate_drawer_metadata(result.metadata, schema)
                 # A skip applies only to the currently announced source item;
                 # adapters may freely interleave drawers for other items.
@@ -901,6 +962,14 @@ def _parse_source_options(raw_options) -> dict:
         key, value = raw.split("=", 1)
         if not key:
             raise argparse.ArgumentTypeError("--source-option key must not be empty")
+        # Keep secret-bearing values out of argv, shell history, and process
+        # inspection. Adapter credentials belong in MEMPALACE_SOURCE_* env.
+        try:
+            from .sources import SourceAdapterProtocolError, validate_source_options
+
+            validate_source_options({key: value})
+        except SourceAdapterProtocolError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
         try:
             options[key] = json.loads(value)
         except json.JSONDecodeError:

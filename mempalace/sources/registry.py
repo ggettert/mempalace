@@ -20,6 +20,7 @@ or config (§3.3). The default when no adapter is named is ``filesystem``
 from __future__ import annotations
 
 import logging
+import atexit
 from importlib import metadata
 from threading import Lock
 from typing import Type
@@ -38,6 +39,14 @@ _discovered = False
 _lock = Lock()
 
 
+def _close_instance(inst: BaseSourceAdapter, *, action: str) -> None:
+    """Best-effort lifecycle cleanup; registry mutation must still complete."""
+    try:
+        inst.close()
+    except Exception:
+        logger.exception("error closing adapter during %s", action)
+
+
 def register(name: str, adapter_cls: Type[BaseSourceAdapter]) -> None:
     """Register ``adapter_cls`` under ``name``.
 
@@ -46,7 +55,9 @@ def register(name: str, adapter_cls: Type[BaseSourceAdapter]) -> None:
     with _lock:
         _registry[name] = adapter_cls
         _explicit.add(name)
-        _instances.pop(name, None)
+        replaced = _instances.pop(name, None)
+    if replaced is not None:
+        _close_instance(replaced, action="replacement")
 
 
 def unregister(name: str) -> None:
@@ -54,7 +65,9 @@ def unregister(name: str) -> None:
     with _lock:
         _registry.pop(name, None)
         _explicit.discard(name)
-        _instances.pop(name, None)
+        removed = _instances.pop(name, None)
+    if removed is not None:
+        _close_instance(removed, action="unregister")
 
 
 def _discover_entry_points() -> None:
@@ -132,12 +145,15 @@ def get_adapter(name: str) -> BaseSourceAdapter:
 def reset_adapters() -> None:
     """Close and drop all cached adapter instances (primarily for tests)."""
     with _lock:
-        for inst in _instances.values():
-            try:
-                inst.close()
-            except Exception:
-                logger.exception("error closing adapter during reset")
+        instances = list(_instances.values())
         _instances.clear()
+    for inst in instances:
+        _close_instance(inst, action="reset")
+
+
+# Long-lived adapters may own sockets, pools, or SQLite connections.  Normal
+# process shutdown needs the same cleanup as explicit unregister/replacement.
+atexit.register(reset_adapters)
 
 
 def resolve_adapter_for_source(

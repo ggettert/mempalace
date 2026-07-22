@@ -208,6 +208,29 @@ def test_unregister_drops_registration_and_cached_instance():
         get_adapter("_trivial")
 
 
+def test_registry_closes_cached_instances_on_replacement_unregister_and_reset():
+    class ClosableAdapter(_TrivialAdapter):
+        name = "closable"
+        closed = []
+
+        def close(self):
+            self.__class__.closed.append(self)
+
+    register("closable", ClosableAdapter)
+    first = get_adapter("closable")
+    # Replacement must release the cached object before the new class is used.
+    register("closable", ClosableAdapter)
+    assert ClosableAdapter.closed == [first]
+    second = get_adapter("closable")
+    unregister("closable")
+    assert ClosableAdapter.closed == [first, second]
+
+    register("closable", ClosableAdapter)
+    third = get_adapter("closable")
+    reset_adapters()
+    assert ClosableAdapter.closed == [first, second, third]
+
+
 def test_resolve_adapter_priority_order():
     # Explicit wins over everything.
     assert resolve_adapter_for_source(explicit="cursor", config_value="git") == "cursor"
