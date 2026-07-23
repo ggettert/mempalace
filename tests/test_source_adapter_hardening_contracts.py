@@ -199,6 +199,32 @@ def test_adapter_gets_sanitized_config_and_read_only_kg_not_live_handles(monkeyp
     assert _KG.instances[0].mutations == []
 
 
+def test_released_adapter_facade_cannot_reach_a_later_invocations_backend(monkeypatch):
+    """Opaque storage handles are invocation leases, never reusable IDs."""
+    from mempalace.sources import PalaceContext, SourceAdapterProtocolError
+
+    first = _Collection()
+    second = _Collection()
+    context = PalaceContext(
+        drawer_collection=first,
+        knowledge_graph=_KG("/palace"),
+        palace_path="/palace",
+    )
+    retained_facade = context.drawer_collection
+    context._release_core_storage()
+    next_context = PalaceContext(
+        drawer_collection=second,
+        knowledge_graph=_KG("/palace"),
+        palace_path="/palace",
+    )
+    try:
+        with pytest.raises(SourceAdapterProtocolError, match="no longer available"):
+            retained_facade.count()
+        assert next_context.drawer_collection.count() == len(second.rows)
+    finally:
+        next_context._release_core_storage()
+
+
 def test_invalid_adapter_mode_or_transforms_fail_before_extraction_or_mutation(monkeypatch):
     class InvalidContractAdapter(BaseSourceAdapter):
         name = "invalid-contract"

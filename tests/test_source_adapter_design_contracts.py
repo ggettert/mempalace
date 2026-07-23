@@ -9,7 +9,9 @@ from mempalace.sources import (
     AdapterSchema,
     BaseSourceAdapter,
     DrawerRecord,
+    RouteHint,
     SourceAdapterProtocolError,
+    SourceItemMetadata,
     register,
     reset_adapters,
 )
@@ -156,6 +158,88 @@ def test_crash_marker_recovers_partial_generation_with_a_fresh_invocation(monkey
     assert not list(marker_dir.glob("*.json"))
 
 
+def test_dry_run_does_not_consume_an_interrupted_commit_marker(monkeypatch, tmp_path):
+    """Dry-run is observational: recovery belongs exclusively to a real run."""
+    class Replace(BaseSourceAdapter):
+        name = "dry-marker"
+        adapter_version = "1"
+
+        def ingest(self, *, source, palace):
+            yield DrawerRecord("new", "item://dry-marker")
+
+        def describe_schema(self):
+            return AdapterSchema(version="1", fields={})
+
+    drawers = _Collection({
+        "old": {"document": "old", "metadata": {
+            "adapter_name": "dry-marker", "source_file": "item://dry-marker", "privacy_class": "pii_potential"
+        }}
+    })
+    _install(monkeypatch, drawers)
+    register("dry-marker", Replace)
+    drawers.delete_interrupt = True
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.mine_source_adapter(source_name="dry-marker", source_path="/src", palace_path=str(tmp_path))
+
+    marker = next((tmp_path / ".mempalace" / "source-reconciliation").glob("*.json"))
+    before = marker.read_bytes()
+    rows_before = dict(drawers.rows)
+    assert cli.mine_source_adapter(
+        source_name="dry-marker", source_path="/src", palace_path=str(tmp_path), dry_run=True
+    ) == 1
+    assert marker.read_bytes() == before
+    assert drawers.rows == rows_before
+
+
+def test_recovery_repairs_closets_before_a_current_item_is_skipped(monkeypatch, tmp_path):
+    class Replace(BaseSourceAdapter):
+        name = "closet-repair"
+        adapter_version = "1"
+        current = False
+
+        def ingest(self, *, source, palace):
+            if self.__class__.current:
+                yield SourceItemMetadata("item://closet-repair", "v1")
+                return
+            yield DrawerRecord("new content", "item://closet-repair")
+
+        def is_current(self, *, item, existing_metadata):
+            return self.__class__.current
+
+        def describe_schema(self):
+            return AdapterSchema(version="1", fields={})
+
+    drawers = _Collection({
+        "old": {"document": "old", "metadata": {
+            "adapter_name": "closet-repair", "source_file": "item://closet-repair", "privacy_class": "pii_potential"
+        }}
+    })
+
+    class InterruptingClosets(_Closets):
+        def delete(self, *, ids=None, where=None):
+            super().delete(ids=ids, where=where)
+            if where is not None and not getattr(self, "interrupted", False):
+                self.interrupted = True
+                raise KeyboardInterrupt("crash while replacing closets")
+
+    closets = InterruptingClosets({
+        "stale": {"document": "stale", "metadata": {
+            "adapter_name": "closet-repair", "source_file": "item://closet-repair"
+        }}
+    })
+    _install(monkeypatch, drawers, closets)
+    register("closet-repair", Replace)
+
+    with pytest.raises(KeyboardInterrupt, match="replacing closets"):
+        cli.mine_source_adapter(source_name="closet-repair", source_path="/src", palace_path=str(tmp_path))
+    assert list((tmp_path / ".mempalace" / "source-reconciliation").glob("*.json"))
+    Replace.current = True
+    cli.mine_source_adapter(source_name="closet-repair", source_path="/src", palace_path=str(tmp_path))
+    rows = _rows_for(closets, "closet-repair", "item://closet-repair")
+    assert rows and rows[0]["document"] != "stale"
+
+
 def test_privacy_downgrade_is_rejected_before_restart_extraction_or_writes(monkeypatch, tmp_path):
     class Privacy(BaseSourceAdapter):
         name = "privacy"
@@ -189,6 +273,35 @@ def test_privacy_downgrade_is_rejected_before_restart_extraction_or_writes(monke
     assert Privacy.calls == 0
     assert _rows_for(drawers, "privacy", "item://privacy")[0]["metadata"]["privacy_class"] == "sensitive"
 
+
+def test_privacy_downgrade_is_rejected_with_an_empty_policy_map(monkeypatch, tmp_path):
+    class Privacy(BaseSourceAdapter):
+        name = "privacy-empty-policy"
+        adapter_version = "1"
+        default_privacy_class = "sensitive"
+        calls = 0
+
+        def ingest(self, *, source, palace):
+            self.__class__.calls += 1
+            yield DrawerRecord("content", "item://privacy-empty-policy")
+
+        def describe_schema(self):
+            return AdapterSchema(version="1", fields={})
+
+    drawers = _Collection({
+        "old": {"document": "old", "metadata": {
+            "adapter_name": "privacy-empty-policy", "source_file": "item://privacy-empty-policy",
+            "privacy_class": "sensitive"
+        }}
+    })
+    _install(monkeypatch, drawers)
+    register("privacy-empty-policy", Privacy)
+    monkeypatch.setattr(_Config, "source_privacy_classes", property(lambda _self: {}))
+    Privacy.default_privacy_class = "public"
+    with pytest.raises(SourceAdapterProtocolError, match="privacy downgrade"):
+        cli.mine_source_adapter(source_name="privacy-empty-policy", source_path="/src", palace_path=str(tmp_path))
+    assert Privacy.calls == 0
+    assert drawers.rows["old"]["metadata"]["privacy_class"] == "sensitive"
 
 def test_unsupported_transform_is_rejected_before_adapter_extraction(monkeypatch, tmp_path):
     class BadTransform(BaseSourceAdapter):
@@ -353,4 +466,26 @@ def test_adapter_route_hint_requires_its_declared_capability(monkeypatch, tmp_pa
     register("unrouted", Unrouted)
     with pytest.raises(SourceAdapterProtocolError, match="adapter_owns_routing"):
         cli.mine_source_adapter(source_name="unrouted", source_path="/src", palace_path=str(tmp_path))
+    assert drawers.rows == {}
+
+
+def test_adapter_helper_route_hint_requires_its_declared_capability(monkeypatch, tmp_path):
+    class UnroutedHelper(BaseSourceAdapter):
+        name = "unrouted-helper"
+        adapter_version = "1"
+
+        def ingest(self, *, source, palace):
+            palace.upsert_drawer(DrawerRecord(
+                "route", "item://helper-route", route_hint=RouteHint(wing="untrusted")
+            ))
+            return iter(())
+
+        def describe_schema(self):
+            return AdapterSchema(version="1", fields={})
+
+    drawers = _Collection()
+    _install(monkeypatch, drawers)
+    register("unrouted-helper", UnroutedHelper)
+    with pytest.raises(SourceAdapterProtocolError, match="adapter_owns_routing"):
+        cli.mine_source_adapter(source_name="unrouted-helper", source_path="/src", palace_path=str(tmp_path))
     assert drawers.rows == {}

@@ -48,6 +48,7 @@ from .base import (
     UNIVERSAL_METADATA_FIELDS,
 )
 from .context import AdapterConfig, PalaceContext, ProgressHook, ReadOnlyKnowledgeGraph
+from .conformance import assert_content_round_trip
 from .registry import (
     available_adapters,
     adapter_session,
@@ -85,6 +86,7 @@ __all__ = [
     "TransformationViolationError",
     "UnknownSourceAdapterError",
     "available_adapters",
+    "assert_content_round_trip",
     "adapter_session",
     "get_adapter",
     "get_adapter_class",

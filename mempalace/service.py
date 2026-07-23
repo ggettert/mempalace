@@ -9,6 +9,7 @@ caller's terminal.
 from __future__ import annotations
 
 import contextlib
+import functools
 import io
 import os
 import sys
@@ -101,6 +102,30 @@ def _capture(fn):
     return result, stdout.getvalue(), stderr.getvalue()
 
 
+def _isolated_job_environment(fn):
+    """Keep direct service API calls as isolated as daemon-dispatched jobs.
+
+    ``execute_job`` already restores these settings, but callers also use
+    ``run_mine``/``run_sync`` directly (including the service contract tests).
+    The operations set process-global configuration to support legacy code,
+    so the direct path must restore it on every return/exception too.
+    """
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        saved_env = {key: os.environ.get(key) for key in _PER_JOB_ENV}
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    return wrapped
+
+
 def execute_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Execute one daemon job and return a JSON-serializable result."""
 
@@ -140,6 +165,7 @@ def execute_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+@_isolated_job_environment
 def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     """Run the same mine operation as the CLI, without daemon transport concerns."""
     palace_path = os.path.abspath(
@@ -317,6 +343,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@_isolated_job_environment
 def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     """Run sync and render the same operator-facing summary shape as the CLI."""
     palace_path = os.path.abspath(

@@ -758,7 +758,13 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
         validate_route_hint,
         validate_source_options,
     )
-    from .sources.reconciliation import recover_markers, remove_marker, write_marker
+    from .sources.reconciliation import (
+        recover_markers,
+        repair_closets,
+        remove_marker,
+        verify_candidate_generation,
+        write_marker,
+    )
     from .palace import mine_palace_lock
 
     adapter_name = resolve_adapter_for_source(explicit=source_name)
@@ -835,6 +841,18 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                 )
 
             try:
+                closets = None
+                build_closet_lines = None
+                upsert_closet_lines = None
+                if not dry_run:
+                    from .palace import build_closet_lines, get_closets_collection, upsert_closet_lines
+
+                    try:
+                        closets = get_closets_collection(palace_path)
+                    except TypeError:
+                        # Compatibility for collection factories predating
+                        # the closets layer.
+                        closets = None
                 # No adapter-visible write reaches storage during extraction.
                 # The constrained collection facade additionally prevents a
                 # third-party adapter from bypassing this staging boundary.
@@ -854,11 +872,14 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                 # A marker outlives a Python exception or process death. Do
                 # this before adapter extraction so an interrupted earlier
                 # run cannot be mistaken for current source metadata.
-                recover_markers(palace_path, collection, adapter_name)
-                # Only an explicit source privacy policy opts a legacy palace
-                # into transition enforcement. This avoids treating older rows
-                # without privacy metadata as an implicit migration protocol.
-                if getattr(config, "source_privacy_classes", {}):
+                # Dry run is strictly observational: it must not even consume
+                # an interrupted marker. A real invocation repairs markers
+                # before current/skip decisions so drawers and closets converge.
+                if not dry_run:
+                    recover_markers(palace_path, collection, adapter_name, closets=closets)
+                # Existing RFC rows define the privacy floor independently of
+                # whether today's optional policy map is populated.
+                if not dry_run:
                     existing_rows = collection.get(where={"adapter_name": adapter_name}).get("metadatas") or []
                     for metadata in existing_rows:
                         existing_privacy = metadata.get("privacy_class") if isinstance(metadata, dict) else None
@@ -888,7 +909,7 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                         },
                     )
 
-                def stage_record(record: DrawerRecord, *, core_routed: bool = False) -> None:
+                def stage_record(record: DrawerRecord) -> None:
                     if (
                         not isinstance(record.content, str)
                         or not isinstance(record.source_file, str)
@@ -908,7 +929,6 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                         return
                     if (
                         record.route_hint is not None
-                        and not core_routed
                         and not adapter_owns_routing
                     ):
                         raise SourceAdapterProtocolError(
@@ -984,7 +1004,7 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                 # them with yielded records after ingest succeeds as well.
                 helper_drawers, helper_deletes = context.drain_staged_mutations()
                 for record in helper_drawers:
-                    stage_record(record, core_routed=True)
+                    stage_record(record)
                 for source_file in helper_deletes:
                     if not isinstance(source_file, str) or not source_file:
                         raise SourceAdapterProtocolError("source_file must be a non-empty string")
@@ -992,6 +1012,12 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                     state["tombstone"] = True
                     state["skip"] = True
                     state["reconcile"] = True
+
+                # All adapter output has been validated, but dry-run never
+                # enters reconciliation: no marker reads, writes, recovery,
+                # backend reads, or synthetic generation bookkeeping.
+                if dry_run:
+                    return sum(len(records) for records in staged_by_source.values())
 
                 # After all protocol, schema, and route checks have succeeded,
                 # write a fresh candidate generation *before* retiring the old
@@ -1006,7 +1032,48 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                     if state["reconcile"] and (not state["skip"] or state["tombstone"])
                 }
                 drawers_written = 0
-                committed_sources: dict[str, tuple[list[DrawerRecord], list[str]]] = {}
+
+                def closet_projection(
+                    source_file: str, records: list[DrawerRecord], candidate_ids: list[str]
+                ) -> dict | None:
+                    """Build the entire repairable closet state before retirement."""
+                    if closets is None:
+                        return None
+                    closet_where = {"$and": [
+                        {"source_file": source_file}, {"adapter_name": adapter_name}
+                    ]}
+                    if not records:
+                        return {"action": "delete", "where": closet_where, "rows": []}
+                    route = records[0].route_hint or default_route
+                    closet_meta = {
+                        "source_file": source_file,
+                        "adapter_name": adapter_name,
+                        "wing": route.wing or "default",
+                        "room": route.room or "general",
+                        "hall": route.hall or "general",
+                        "drawer_count": len(candidate_ids),
+                    }
+                    lines = build_closet_lines(
+                        source_file, candidate_ids, "\n".join(record.content for record in records),
+                        closet_meta["wing"], closet_meta["room"],
+                    )
+                    import hashlib
+
+                    base = "closet_source_" + hashlib.sha256(
+                        f"{adapter_name}\0{source_file}".encode("utf-8")
+                    ).hexdigest()[:24]
+
+                    class ClosetRows:
+                        rows: list[dict] = []
+
+                        def upsert(self, *, documents, ids, metadatas):
+                            self.rows.extend({"id": row_id, "document": document, "metadata": metadata}
+                                             for document, row_id, metadata in zip(documents, ids, metadatas))
+
+                    captured = ClosetRows()
+                    upsert_closet_lines(captured, base, lines, closet_meta)
+                    return {"action": "replace", "where": closet_where, "rows": captured.rows}
+
                 for source_file, state in states.items():
                     if not state["reconcile"] or state["skip"] and not state["tombstone"]:
                         continue
@@ -1015,7 +1082,7 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                     suffix = f"_{generation}" if previous_ids.get(source_file) else ""
                     candidate_ids = [context._drawer_id_for(record, id_suffix=suffix) for record in records]
                     marker = {
-                        "version": 1,
+                        "version": 2,
                         "adapter_name": adapter_name,
                         "source_file": source_file,
                         "generation": generation,
@@ -1023,6 +1090,9 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                         "old_ids": previous_ids.get(source_file, []),
                         "candidate_ids": candidate_ids,
                     }
+                    projection = closet_projection(source_file, records, candidate_ids)
+                    if projection is not None:
+                        marker["closet"] = projection
                     marker_path = write_marker(palace_path, marker)
                     try:
                         for record in records:
@@ -1039,7 +1109,11 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                                 "could not roll back prepared source-adapter generation"
                             )
                         raise
-                    marker["phase"] = "committing"
+                    # Do not authorize retirement until every intended ID has
+                    # been read back with the generation stamped by core.
+                    if marker_path is not None:
+                        verify_candidate_generation(collection, marker)
+                    marker["phase"] = "retiring_drawers"
                     marker_path = write_marker(palace_path, marker) or marker_path
                     # Exact old-ID retirement is safe to repeat after a crash.
                     context._delete_drawer_ids(previous_ids.get(source_file, []))
@@ -1047,48 +1121,12 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                         # Legacy in-memory integrations have no durable
                         # marker namespace; retain their scoped-delete API.
                         context.delete_source_item(source_file)
+                    marker["phase"] = "repairing_closets"
+                    marker_path = write_marker(palace_path, marker) or marker_path
+                    repair_closets(marker, closets)
+                    marker["phase"] = "closets_repaired"
+                    marker_path = write_marker(palace_path, marker) or marker_path
                     remove_marker(marker_path)
-                    committed_sources[source_file] = (records, candidate_ids)
-
-                # Core owns derived closet rows. Their source identity is
-                # equally adapter-scoped so a tombstone/update cannot erase a
-                # second adapter's index for the same URI.
-                if not dry_run and committed_sources:
-                    from .palace import build_closet_lines, get_closets_collection, upsert_closet_lines
-                    import hashlib
-
-                    try:
-                        closets = get_closets_collection(palace_path)
-                    except TypeError:
-                        # Compatibility for tests/third-party in-memory
-                        # collection factories predating the closets layer.
-                        closets = None
-                    if closets is None:
-                        return drawers_written
-                    for source_file, (records, candidate_ids) in committed_sources.items():
-                        closet_where = {"$and": [
-                            {"source_file": source_file}, {"adapter_name": adapter_name}
-                        ]}
-                        closets.delete(where=closet_where)
-                        if not records:
-                            continue
-                        route = records[0].route_hint or default_route
-                        closet_meta = {
-                            "source_file": source_file,
-                            "adapter_name": adapter_name,
-                            "wing": route.wing or "default",
-                            "room": route.room or "general",
-                            "hall": route.hall or "general",
-                            "drawer_count": len(candidate_ids),
-                        }
-                        lines = build_closet_lines(
-                            source_file, candidate_ids, "\n".join(record.content for record in records),
-                            closet_meta["wing"], closet_meta["room"],
-                        )
-                        base = "closet_source_" + hashlib.sha256(
-                            f"{adapter_name}\0{source_file}".encode("utf-8")
-                        ).hexdigest()[:24]
-                        upsert_closet_lines(closets, base, lines, closet_meta)
                 return drawers_written
             finally:
                 context._release_core_storage()

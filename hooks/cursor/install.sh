@@ -196,10 +196,14 @@ fi
 
 # mktemp portability: pass an explicit absolute template so we sidestep
 # the BSD vs GNU difference in `-t` semantics (BSD treats it as a
-# prefix; GNU treats it as a template). Honour TMPDIR if set, fall
-# back to /tmp. gh-PR review caught the previous `-t` form as
+# prefix; GNU treats it as a template). The target's parent is always the
+# operation's writable filesystem and avoids making an otherwise harmless
+# dry-run/install fail merely because a shared `/tmp` tmpfs is full. Keep
+# the helper outside `.cursor` itself so dry-run never leaves that target
+# directory behind. gh-PR review caught the previous `-t` form as
 # non-portable.
-MERGE_PY="$(mktemp "${TMPDIR:-/tmp}/mempal-install-merge.XXXXXX")"
+MERGE_TMP_DIR="$(dirname "$TARGET_DIR")"
+MERGE_PY="$(mktemp "$MERGE_TMP_DIR/mempal-install-merge.XXXXXX")"
 trap 'rm -f "$MERGE_PY"' EXIT
 
 cat > "$MERGE_PY" <<'PYEOF'

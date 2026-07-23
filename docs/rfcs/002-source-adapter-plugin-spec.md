@@ -708,6 +708,17 @@ A generator-based property test validates that every record yielded by `ingest` 
 
 No existing test in `tests/` asserts byte-preservation or declared-transformation correctness (verified via grep of `tests/` for `verbatim|byte.?preserv|round.?trip`). This RFC's conformance suite introduces the first such coverage. The existing MISSION.md claim of "verbatim always" is a social contract until this lands; afterward it becomes a machine-verified property of adapters that declare `byte_preserving`.
 
+**Core harness and fixture boundary.** Core provides
+`mempalace.sources.conformance.assert_content_round_trip` for the §7.2/§7.3
+assertion. Adapter packages MUST call it from fixture tests because only the
+adapter package owns canonical file/API bytes; normal dispatch intentionally
+does not invent canonical bytes or claim it has verified them. For a lossy
+pipeline, the test supplies an explicit ordered tuple containing exactly the
+adapter's `declared_transformations`: the published `frozenset` declaration
+does not retain order. Automatic discovery/execution of third-party fixture
+suites is deliberately out of scope for core dispatch; this helper prevents a
+package from making an untested byte-preserving or declared-lossy claim.
+
 ---
 
 ## 8. Versioning and compatibility

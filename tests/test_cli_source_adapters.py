@@ -137,7 +137,10 @@ def test_cmd_mine_source_dispatches_registered_adapter_through_palace_context(mo
     # Adapters receive a constrained read-only collection facade; only core
     # retains the raw backend so they cannot bypass staged reconciliation.
     assert adapter.palace.drawer_collection is not collection
-    assert adapter.palace.drawer_collection.get(where={}) == {"ids": [], "metadatas": []}
+    # The invocation lease is released in ``finally``; retaining a facade
+    # cannot accidentally expose a later mine's backend.
+    with pytest.raises(SourceAdapterProtocolError, match="no longer available"):
+        adapter.palace.drawer_collection.get(where={})
     assert adapter.palace.knowledge_graph is not _FakeKnowledgeGraph.instances[0]
     assert not hasattr(adapter.palace.knowledge_graph, "add_triple")
     assert _FakeKnowledgeGraph.instances[0].closed is True
@@ -297,6 +300,7 @@ def test_changed_source_item_is_replaced_and_incremental_lookup_is_adapter_scope
         ]
     }
     assert collection.gets == [
+        {"where": {"adapter_name": "incremental"}},
         {"where": expected_where, "limit": 1},
         {"where": expected_where, "include": []},
     ]
