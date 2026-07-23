@@ -364,6 +364,25 @@ def validate_adapter_contract(adapter: "BaseSourceAdapter") -> None:
         raise SourceAdapterProtocolError(
             "declared_transformations must be a frozenset of non-empty strings"
         )
+    # A declaration is only useful when conformance tooling can reproduce it.
+    # Reserved transforms are supplied by core; an adapter-specific transform
+    # must publish the RFC 002 reference callable in the shared module before
+    # core invokes third-party extraction code.
+    from . import transforms as transform_registry
+
+    for name in transforms:
+        if name in transform_registry.RESERVED_TRANSFORMATIONS:
+            continue
+        reference_name = f"{adapter.name.replace('-', '_')}_{name.replace('-', '_')}"
+        if not callable(getattr(transform_registry, reference_name, None)):
+            raise SourceAdapterProtocolError(
+                f"unsupported transformation {name!r}; publish callable "
+                f"mempalace.sources.transforms.{reference_name}"
+            )
+    if "byte_preserving" in getattr(adapter, "capabilities", frozenset()) and transforms:
+        raise SourceAdapterProtocolError(
+            "byte_preserving adapters must declare an empty declared_transformations set"
+        )
 
 
 def validate_drawer_ingest_mode(metadata: dict, adapter: "BaseSourceAdapter") -> str:

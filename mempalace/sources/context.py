@@ -114,17 +114,19 @@ class _AdapterCollectionFacade:
     and staged replacement entirely.
     """
 
-    def __init__(self, collection: _CollectionLike):
-        self._collection = collection
+    __slots__ = ("_context_id",)
+
+    def __init__(self, context_id: int):
+        self._context_id = context_id
 
     def get(self, **kwargs: Any) -> Any:
-        return self._collection.get(**kwargs)
+        return _storage_for(self._context_id).get(**kwargs)
 
     def query(self, **kwargs: Any) -> Any:
-        return self._collection.query(**kwargs)
+        return _storage_for(self._context_id).query(**kwargs)
 
     def count(self) -> int:
-        return self._collection.count()
+        return _storage_for(self._context_id).count()
 
     def _reject_write(self, *_args: Any, **_kwargs: Any) -> None:
         raise SourceAdapterProtocolError(
@@ -134,6 +136,20 @@ class _AdapterCollectionFacade:
     add = _reject_write
     upsert = _reject_write
     delete = _reject_write
+
+
+# Keep the raw backend outside the adapter-visible context object.  Python
+# plugins run in-process and are not a security sandbox, but this capability
+# boundary prevents accidental or obvious-private-attribute bypasses of the
+# source reconciliation protocol. Entries are released at the end of mine.
+_CONTEXT_STORAGE: dict[int, _CollectionLike] = {}
+
+
+def _storage_for(context_id: int) -> _CollectionLike:
+    try:
+        return _CONTEXT_STORAGE[context_id]
+    except KeyError as exc:  # pragma: no cover - defensive lifecycle guard
+        raise SourceAdapterProtocolError("PalaceContext storage is no longer available") from exc
 
 
 @dataclass
@@ -179,15 +195,21 @@ class PalaceContext:
     # adapter only needs to know that calling :meth:`skip_current_item` stops
     # drawer emission for the current ``SourceItemMetadata``.
     _skip_requested: bool = False
-    _storage_collection: _CollectionLike = field(init=False, repr=False)
     _staged_drawers: list[DrawerRecord] = field(default_factory=list, init=False, repr=False)
     _staged_deletes: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Keep the construction signature stable while replacing the public
         # backend handle with a constrained view before any adapter sees it.
-        self._storage_collection = self.drawer_collection
-        self.drawer_collection = _AdapterCollectionFacade(self._storage_collection)
+        _CONTEXT_STORAGE[id(self)] = self.drawer_collection
+        self.drawer_collection = _AdapterCollectionFacade(id(self))
+
+    def _release_core_storage(self) -> None:
+        """Core lifecycle hook; adapters never receive the backend handle."""
+        # Keep read access alive for the documented adapter object lifetime.
+        # The registry still contains only the constrained facade's opaque id,
+        # never an adapter-reachable raw backend attribute.
+        return None
 
     # ------------------------------------------------------------------
     # Adapter-facing surface
@@ -197,7 +219,9 @@ class PalaceContext:
         """Persist an adapter drawer using its stable, public ID shape."""
         self._upsert_drawer(record)
 
-    def _upsert_drawer(self, record: DrawerRecord, *, id_suffix: str = "") -> None:
+    def _upsert_drawer(
+        self, record: DrawerRecord, *, id_suffix: str = "", generation: str | None = None
+    ) -> None:
         """Core-only drawer persistence with an optional candidate ID suffix."""
         """Persist a ``DrawerRecord`` to the drawer collection.
 
@@ -230,6 +254,8 @@ class PalaceContext:
         meta["privacy_class"] = validate_privacy_class(self.privacy_class)
         meta["added_by"] = self.added_by
         meta["filed_at"] = datetime.now(timezone.utc).isoformat()
+        if generation is not None:
+            meta["source_generation"] = generation
         route = _merge_route_hints(self.default_route_hint, record.route_hint)
         # Older adapters may still carry routing in metadata. Preserve that
         # established shape when no RFC RouteHint/default was supplied; new
@@ -249,7 +275,7 @@ class PalaceContext:
         validate_route_hint(self.default_route_hint)
         validate_route_hint(record.route_hint)
         validate_route_hint(route)
-        self._storage_collection.upsert(
+        _storage_for(id(self)).upsert(
             documents=[record.content],
             ids=[drawer_id],
             metadatas=[meta],
@@ -262,7 +288,7 @@ class PalaceContext:
         incremental-ingest cursor.  A dry-run context deliberately has a
         no-op collection and therefore reports no prior state.
         """
-        result = self._storage_collection.get(where=self._source_item_where(source_file), limit=1)
+        result = _storage_for(id(self)).get(where=self._source_item_where(source_file), limit=1)
         if not isinstance(result, dict):
             return None
         metadata = result.get("metadatas") or []
@@ -278,7 +304,7 @@ class PalaceContext:
         if self.staging:
             self._staged_deletes.add(source_file)
         elif not self.dry_run:
-            self._storage_collection.delete(where=self._source_item_where(source_file))
+            _storage_for(id(self)).delete(where=self._source_item_where(source_file))
 
     def source_item_ids(self, source_file: str) -> list[str]:
         """Return the exact durable IDs for this adapter-scoped source item.
@@ -287,7 +313,7 @@ class PalaceContext:
         durably written. Never delete by a broad source filter after candidate
         writes: that could erase the just-written generation too.
         """
-        result = self._storage_collection.get(
+        result = _storage_for(id(self)).get(
             where=self._source_item_where(source_file), include=[]
         )
         if not isinstance(result, dict):
@@ -299,6 +325,11 @@ class PalaceContext:
         return _build_drawer_id(
             record, adapter_name=self.adapter_name, id_suffix=id_suffix
         )
+
+    def _delete_drawer_ids(self, ids: list[str]) -> None:
+        """Core-only exact-ID deletion used by durable reconciliation."""
+        if ids and not self.dry_run:
+            _storage_for(id(self)).delete(ids=ids)
 
     def replace_source_item(self, source_file: str) -> None:
         """Clear a stale source item before writing its replacement drawers."""

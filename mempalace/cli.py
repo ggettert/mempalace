@@ -748,6 +748,7 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
         UnknownSourceAdapterError,
         adapter_session,
         privacy_class_is_admitted,
+        PRIVACY_CLASSES,
         resolve_adapter_for_source,
         validate_adapter_schema,
         validate_adapter_contract,
@@ -757,6 +758,7 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
         validate_route_hint,
         validate_source_options,
     )
+    from .sources.reconciliation import recover_markers, remove_marker, write_marker
     from .palace import mine_palace_lock
 
     adapter_name = resolve_adapter_for_source(explicit=source_name)
@@ -849,8 +851,31 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                     dry_run=dry_run,
                     staging=True,
                 )
+                # A marker outlives a Python exception or process death. Do
+                # this before adapter extraction so an interrupted earlier
+                # run cannot be mistaken for current source metadata.
+                recover_markers(palace_path, collection, adapter_name)
+                # Only an explicit source privacy policy opts a legacy palace
+                # into transition enforcement. This avoids treating older rows
+                # without privacy metadata as an implicit migration protocol.
+                if getattr(config, "source_privacy_classes", {}):
+                    existing_rows = collection.get(where={"adapter_name": adapter_name}).get("metadatas") or []
+                    for metadata in existing_rows:
+                        existing_privacy = metadata.get("privacy_class") if isinstance(metadata, dict) else None
+                        if existing_privacy in PRIVACY_CLASSES and (
+                            PRIVACY_CLASSES.index(privacy_class) < PRIVACY_CLASSES.index(existing_privacy)
+                        ):
+                            raise SourceAdapterProtocolError(
+                                "privacy downgrade requires an RFC migration/audit record; "
+                                f"refusing {existing_privacy!r} -> {privacy_class!r}"
+                            )
                 states: dict[str, dict] = {}
                 staged_by_source: dict[str, list[DrawerRecord]] = {}
+                logical_chunks: set[tuple[str, int]] = set()
+                explicit_route_fields = frozenset(
+                    field for field in ("wing", "room", "hall") if field in source.options
+                )
+                adapter_owns_routing = "adapter_owns_routing" in getattr(adapter, "capabilities", frozenset())
 
                 def state_for(source_file: str) -> dict:
                     return states.setdefault(
@@ -863,7 +888,7 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                         },
                     )
 
-                def stage_record(record: DrawerRecord) -> None:
+                def stage_record(record: DrawerRecord, *, core_routed: bool = False) -> None:
                     if (
                         not isinstance(record.content, str)
                         or not isinstance(record.source_file, str)
@@ -881,13 +906,33 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                     state = state_for(record.source_file)
                     if state["skip"] or state["tombstone"]:
                         return
+                    if (
+                        record.route_hint is not None
+                        and not core_routed
+                        and not adapter_owns_routing
+                    ):
+                        raise SourceAdapterProtocolError(
+                            "adapter RouteHint requires the adapter_owns_routing capability"
+                        )
                     item_route = state["route"]
                     effective_route = RouteHint(
                         wing=(record.route_hint.wing if record.route_hint and record.route_hint.wing is not None else item_route.wing),
                         room=(record.route_hint.room if record.route_hint and record.route_hint.room is not None else item_route.room),
                         hall=(record.route_hint.hall if record.route_hint and record.route_hint.hall is not None else item_route.hall),
                     )
+                    # RFC 002 §2.5: explicit client routing always wins over
+                    # a config/adapter hint. Config matching remains adapter
+                    # owned; generic defaults are only the final fallback.
+                    for field in explicit_route_fields:
+                        effective_route = replace(effective_route, **{field: source.options[field]})
                     validate_route_hint(effective_route)
+                    identity = (record.source_file, record.chunk_index)
+                    if identity in logical_chunks:
+                        raise SourceAdapterProtocolError(
+                            f"duplicate logical chunk for source item {record.source_file!r}, "
+                            f"chunk_index={record.chunk_index}"
+                        )
+                    logical_chunks.add(identity)
                     state["reconcile"] = True  # eager adapters have no item metadata
                     staged_by_source.setdefault(record.source_file, []).append(
                         replace(record, metadata=metadata, route_hint=effective_route)
@@ -904,6 +949,13 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                                 "SourceItemMetadata.version must be a string"
                             )
                         validate_route_hint(result.route_hint)
+                        if (
+                            result.route_hint is not None
+                            and not adapter_owns_routing
+                        ):
+                            raise SourceAdapterProtocolError(
+                                "adapter RouteHint requires the adapter_owns_routing capability"
+                            )
                         state = state_for(result.source_file)
                         state["route"] = result.route_hint or default_route
                         context.default_route_hint = state["route"]
@@ -932,7 +984,7 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                 # them with yielded records after ingest succeeds as well.
                 helper_drawers, helper_deletes = context.drain_staged_mutations()
                 for record in helper_drawers:
-                    stage_record(record)
+                    stage_record(record, core_routed=True)
                 for source_file in helper_deletes:
                     if not isinstance(source_file, str) or not source_file:
                         raise SourceAdapterProtocolError("source_file must be a non-empty string")
@@ -951,46 +1003,95 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                 previous_ids = {
                     source_file: context.source_item_ids(source_file)
                     for source_file, state in states.items()
-                    if state["reconcile"] and not state["skip"] and not state["tombstone"]
+                    if state["reconcile"] and (not state["skip"] or state["tombstone"])
                 }
                 drawers_written = 0
-                candidate_ids: list[str] = []
-                try:
-                    for source_file, records in staged_by_source.items():
-                        state = states[source_file]
-                        if state["skip"] or state["tombstone"]:
-                            continue
-                        # Existing rows require a distinct candidate generation;
-                        # stable IDs remain unchanged for first ingest.
-                        suffix = f"_{uuid4().hex}" if previous_ids.get(source_file) else ""
+                committed_sources: dict[str, tuple[list[DrawerRecord], list[str]]] = {}
+                for source_file, state in states.items():
+                    if not state["reconcile"] or state["skip"] and not state["tombstone"]:
+                        continue
+                    records = [] if state["tombstone"] else staged_by_source.get(source_file, [])
+                    generation = uuid4().hex
+                    suffix = f"_{generation}" if previous_ids.get(source_file) else ""
+                    candidate_ids = [context._drawer_id_for(record, id_suffix=suffix) for record in records]
+                    marker = {
+                        "version": 1,
+                        "adapter_name": adapter_name,
+                        "source_file": source_file,
+                        "generation": generation,
+                        "phase": "prepared",
+                        "old_ids": previous_ids.get(source_file, []),
+                        "candidate_ids": candidate_ids,
+                    }
+                    marker_path = write_marker(palace_path, marker)
+                    try:
                         for record in records:
-                            candidate_ids.append(context._drawer_id_for(record, id_suffix=suffix))
-                            context._upsert_drawer(record, id_suffix=suffix)
+                            context._upsert_drawer(record, id_suffix=suffix, generation=generation)
                             drawers_written += 1
-                except Exception:
-                    # The old generation is still untouched. Best-effort cleanup
-                    # of already durable candidates avoids exposing an incomplete
-                    # replacement; never mask the original write failure.
-                    if candidate_ids:
+                    except Exception:
+                        # Exception recovery is an optimisation; the durable
+                        # prepared marker remains authoritative after a kill.
                         try:
-                            context._storage_collection.delete(ids=candidate_ids)
+                            context._delete_drawer_ids(candidate_ids)
+                            remove_marker(marker_path)
                         except Exception:
                             logging.getLogger(__name__).exception(
-                                "could not roll back staged source-adapter candidates"
+                                "could not roll back prepared source-adapter generation"
                             )
-                    raise
-                # Candidate writes completed, so now retire only the exact old
-                # IDs captured before writing. Tombstones intentionally have
-                # no replacement and retain their scoped delete semantics.
-                for source_file, state in states.items():
-                    if state["tombstone"]:
+                        raise
+                    marker["phase"] = "committing"
+                    marker_path = write_marker(palace_path, marker) or marker_path
+                    # Exact old-ID retirement is safe to repeat after a crash.
+                    context._delete_drawer_ids(previous_ids.get(source_file, []))
+                    if state["tombstone"] and marker_path is None:
+                        # Legacy in-memory integrations have no durable
+                        # marker namespace; retain their scoped-delete API.
                         context.delete_source_item(source_file)
-                    elif state["reconcile"]:
-                        ids = previous_ids.get(source_file, [])
-                        if ids:
-                            context._storage_collection.delete(ids=ids)
+                    remove_marker(marker_path)
+                    committed_sources[source_file] = (records, candidate_ids)
+
+                # Core owns derived closet rows. Their source identity is
+                # equally adapter-scoped so a tombstone/update cannot erase a
+                # second adapter's index for the same URI.
+                if not dry_run and committed_sources:
+                    from .palace import build_closet_lines, get_closets_collection, upsert_closet_lines
+                    import hashlib
+
+                    try:
+                        closets = get_closets_collection(palace_path)
+                    except TypeError:
+                        # Compatibility for tests/third-party in-memory
+                        # collection factories predating the closets layer.
+                        closets = None
+                    if closets is None:
+                        return drawers_written
+                    for source_file, (records, candidate_ids) in committed_sources.items():
+                        closet_where = {"$and": [
+                            {"source_file": source_file}, {"adapter_name": adapter_name}
+                        ]}
+                        closets.delete(where=closet_where)
+                        if not records:
+                            continue
+                        route = records[0].route_hint or default_route
+                        closet_meta = {
+                            "source_file": source_file,
+                            "adapter_name": adapter_name,
+                            "wing": route.wing or "default",
+                            "room": route.room or "general",
+                            "hall": route.hall or "general",
+                            "drawer_count": len(candidate_ids),
+                        }
+                        lines = build_closet_lines(
+                            source_file, candidate_ids, "\n".join(record.content for record in records),
+                            closet_meta["wing"], closet_meta["room"],
+                        )
+                        base = "closet_source_" + hashlib.sha256(
+                            f"{adapter_name}\0{source_file}".encode("utf-8")
+                        ).hexdigest()[:24]
+                        upsert_closet_lines(closets, base, lines, closet_meta)
                 return drawers_written
             finally:
+                context._release_core_storage()
                 if not dry_run:
                     knowledge_graph.close()
 

@@ -550,6 +550,7 @@ def test_adapter_persists_universal_metadata_and_route_hints(monkeypatch):
         name = "routed"
         adapter_version = "7.2.0"
         default_privacy_class = "internal"
+        capabilities = frozenset({"adapter_owns_routing"})
 
         def ingest(self, *, source, palace):
             yield SourceItemMetadata(
@@ -663,6 +664,7 @@ def test_daemon_maps_adapter_errors_like_cli(monkeypatch):
 def test_interleaved_source_items_keep_independent_skip_replace_and_route_state(monkeypatch):
     class InterleavedAdapter(BaseSourceAdapter):
         name = "interleaved"
+        capabilities = frozenset({"adapter_owns_routing"})
 
         def ingest(self, *, source, palace):
             yield SourceItemMetadata(
@@ -724,6 +726,7 @@ def test_adapter_reconciliation_stages_all_output_before_replacing_existing_draw
 def test_adapter_rejects_invalid_default_and_merged_routes_before_storage_mutation(monkeypatch):
     class InvalidRouteAdapter(BaseSourceAdapter):
         name = "invalid-route"
+        capabilities = frozenset({"adapter_owns_routing"})
 
         def ingest(self, *, source, palace):
             yield SourceItemMetadata(source_file="item://route", version="new")
