@@ -38,14 +38,16 @@ from .base import (
     TransformationViolationError,
     UnknownSourceAdapterError,
     validate_adapter_schema,
+    validate_adapter_contract,
     validate_drawer_metadata,
+    validate_drawer_ingest_mode,
     validate_privacy_class,
     validate_route_hint,
     validate_source_options,
     privacy_class_is_admitted,
     UNIVERSAL_METADATA_FIELDS,
 )
-from .context import PalaceContext, ProgressHook
+from .context import AdapterConfig, PalaceContext, ProgressHook, ReadOnlyKnowledgeGraph
 from .registry import (
     available_adapters,
     adapter_session,
@@ -59,6 +61,7 @@ from .registry import (
 
 __all__ = [
     "AdapterClosedError",
+    "AdapterConfig",
     "AdapterSchema",
     "AuthRequiredError",
     "BaseSourceAdapter",
@@ -68,6 +71,7 @@ __all__ = [
     "IngestResult",
     "PalaceContext",
     "ProgressHook",
+    "ReadOnlyKnowledgeGraph",
     "RouteHint",
     "PRIVACY_CLASSES",
     "PrivacyClassRejectedError",
@@ -89,7 +93,9 @@ __all__ = [
     "resolve_adapter_for_source",
     "unregister",
     "validate_adapter_schema",
+    "validate_adapter_contract",
     "validate_drawer_metadata",
+    "validate_drawer_ingest_mode",
     "validate_privacy_class",
     "validate_route_hint",
     "validate_source_options",

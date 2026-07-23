@@ -57,7 +57,10 @@ class _FakeCollection:
 
     def get(self, **kwargs):
         self.gets.append(kwargs)
-        return {"metadatas": [self.existing_metadata] if self.existing_metadata else []}
+        return {
+            "ids": ["legacy-id"] if self.existing_metadata else [],
+            "metadatas": [self.existing_metadata] if self.existing_metadata else [],
+        }
 
     def delete(self, **kwargs):
         self.deletes.append(kwargs)
@@ -134,11 +137,13 @@ def test_cmd_mine_source_dispatches_registered_adapter_through_palace_context(mo
     # Adapters receive a constrained read-only collection facade; only core
     # retains the raw backend so they cannot bypass staged reconciliation.
     assert adapter.palace.drawer_collection is not collection
-    assert adapter.palace.drawer_collection.get(where={}) == {"metadatas": []}
-    assert adapter.palace.knowledge_graph is _FakeKnowledgeGraph.instances[0]
+    assert adapter.palace.drawer_collection.get(where={}) == {"ids": [], "metadatas": []}
+    assert adapter.palace.knowledge_graph is not _FakeKnowledgeGraph.instances[0]
+    assert not hasattr(adapter.palace.knowledge_graph, "add_triple")
     assert _FakeKnowledgeGraph.instances[0].closed is True
     assert collection.upserts[0]["documents"] == ["fixture content"]
     assert collection.upserts[0]["metadatas"][0]["adapter_name"] == "fixture"
+    assert collection.upserts[0]["metadatas"][0]["ingest_mode"] == "chunked_content"
 
 
 def test_cmd_mine_source_rejects_unknown_adapter(capsys):
@@ -291,8 +296,11 @@ def test_changed_source_item_is_replaced_and_incremental_lookup_is_adapter_scope
             {"adapter_name": "incremental"},
         ]
     }
-    assert collection.gets == [{"where": expected_where, "limit": 1}]
-    assert collection.deletes == [{"where": expected_where}]
+    assert collection.gets == [
+        {"where": expected_where, "limit": 1},
+        {"where": expected_where, "include": []},
+    ]
+    assert collection.deletes == [{"ids": ["legacy-id"]}]
     assert collection.upserts[0]["metadatas"][0]["source_file"] == source_file
 
 
@@ -316,16 +324,8 @@ def test_eager_adapter_replaces_stale_chunks_without_source_metadata(monkeypatch
         )
         == 1
     )
-    assert collection.deletes == [
-        {
-            "where": {
-                "$and": [
-                    {"source_file": "fixture://item"},
-                    {"adapter_name": "eager"},
-                ]
-            }
-        }
-    ]
+    # No prior item exists, so first ingest has no stale IDs to retire.
+    assert collection.deletes == []
 
 
 @pytest.mark.parametrize(
@@ -385,7 +385,7 @@ def test_adapter_dry_run_never_initializes_writable_storage_or_kg(monkeypatch):
         def ingest(self, *, source, palace):
             # The supported facade methods remain side-effect-free in dry run.
             palace.upsert_drawer(DrawerRecord(content="helper preview", source_file="fixture://helper"))
-            palace.knowledge_graph.add_triple("a", "b", "c")
+            assert not hasattr(palace.knowledge_graph, "add_triple")
             yield DrawerRecord(content="preview", source_file="fixture://preview")
 
         def describe_schema(self):
@@ -690,9 +690,7 @@ def test_interleaved_source_items_keep_independent_skip_replace_and_route_state(
     assert cli.mine_source_adapter(source_name="interleaved", source_path="/source", palace_path="/fake") == 1
     assert collection.upserts[0]["documents"] == ["replace"]
     assert collection.upserts[0]["metadatas"][0]["wing"] == "replace"
-    assert collection.deletes == [
-        {"where": {"$and": [{"source_file": "item://replace"}, {"adapter_name": "interleaved"}]}}
-    ]
+    assert collection.deletes == [{"ids": ["legacy-id"]}]
 
 
 @pytest.mark.parametrize("failure", ["malformed", "exception"])

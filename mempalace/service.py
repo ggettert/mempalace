@@ -150,11 +150,20 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
 
     source = payload.get("source") or payload.get("dir")
     source_adapter = payload.get("source_adapter")
-    mode = payload.get("mode") or "projects"
+    requested_mode = payload.get("mode")
+    mode = requested_mode or "projects"
     wing = payload.get("wing")
     agent = payload.get("agent") or "mempalace"
     limit = int(payload.get("limit") or 0)
     dry_run = bool(payload.get("dry_run"))
+
+    if source_adapter and requested_mode is not None:
+        return {
+            "success": False,
+            "error": "source_adapter cannot be combined with legacy mode",
+            "error_class": "ConflictingMineMode",
+            "exit_code": 2,
+        }
 
     if payload.get("redetect_origin") and not source_adapter:
         from .cli import _run_pass_zero

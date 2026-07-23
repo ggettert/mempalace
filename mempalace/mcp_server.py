@@ -2764,7 +2764,7 @@ def _capture_fd_stdout(fn):
 
 def tool_mine(
     source: str,
-    mode: str = "projects",
+    mode: Optional[str] = None,
     source_adapter: str = None,
     source_uri: bool = False,
     source_options: dict = None,
@@ -2815,6 +2815,13 @@ def tool_mine(
         return {"success": False, "error": np.get("error", "no palace"), "hint": np.get("hint")}
 
     valid_modes = ("projects", "convos", "extract")
+    if source_adapter and mode is not None:
+        return {
+            "success": False,
+            "error": "source_adapter cannot be combined with legacy mode",
+            "error_class": "ConflictingMineMode",
+        }
+    mode = mode or "projects"
     if mode not in valid_modes:
         return {
             "success": False,
@@ -4475,7 +4482,7 @@ TOOLS = {
                 },
                 "source_adapter": {
                     "type": "string",
-                    "description": "Registered RFC 002 source adapter. When set, source may be a URI.",
+                    "description": "Registered RFC 002 source adapter. Mutually exclusive with mode; source may be a URI.",
                 },
                 "source_uri": {
                     "type": "boolean",

@@ -36,6 +36,7 @@ import sys
 import shlex
 import argparse
 import json
+import logging
 from pathlib import Path
 
 from .config import MempalaceConfig
@@ -591,6 +592,9 @@ def cmd_mine(args):
             "redetect_origin": getattr(args, "redetect_origin", False),
         }
         if source_adapter:
+            # ``mode`` is a legacy selector and must stay absent for explicit
+            # source jobs so daemon validation can reject actual conflicts.
+            payload.pop("mode", None)
             payload["source_adapter"] = source_adapter
             payload["source_uri"] = source_is_uri
             payload["source_options"] = source_options
@@ -729,10 +733,13 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
     run reaches the destructive reconciliation phase.
     """
     from dataclasses import replace
+    from uuid import uuid4
 
     from .sources import (
         DrawerRecord,
+        AdapterConfig,
         PalaceContext,
+        ReadOnlyKnowledgeGraph,
         RouteHint,
         SourceRef,
         SourceAdapterProtocolError,
@@ -743,7 +750,9 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
         privacy_class_is_admitted,
         resolve_adapter_for_source,
         validate_adapter_schema,
+        validate_adapter_contract,
         validate_drawer_metadata,
+        validate_drawer_ingest_mode,
         validate_privacy_class,
         validate_route_hint,
         validate_source_options,
@@ -780,6 +789,7 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
             )
         if not isinstance(adapter.adapter_version, str) or not adapter.adapter_version:
             raise SourceAdapterProtocolError("adapter_version must be a non-empty string")
+        validate_adapter_contract(adapter)
         schema = adapter.describe_schema()
         validate_adapter_schema(schema)
         source = SourceRef(
@@ -809,7 +819,7 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
         )
         validate_route_hint(default_route)
 
-        def run() -> int:
+        def run() -> int:  # noqa: C901 - staged protocol validation is centralized here
             if dry_run:
                 collection = _DryRunCollection()
                 knowledge_graph = _DryRunKnowledgeGraph()
@@ -828,9 +838,9 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                 # third-party adapter from bypassing this staging boundary.
                 context = PalaceContext(
                     drawer_collection=collection,
-                    knowledge_graph=knowledge_graph,
+                    knowledge_graph=ReadOnlyKnowledgeGraph(knowledge_graph),
                     palace_path=palace_path,
-                    config=config,
+                    config=AdapterConfig.from_config(config),
                     adapter_name=adapter_name,
                     adapter_version=adapter.adapter_version,
                     added_by=agent,
@@ -865,7 +875,9 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                     if type(record.chunk_index) is not int:
                         raise SourceAdapterProtocolError("DrawerRecord.chunk_index must be an int")
                     validate_route_hint(record.route_hint)
-                    validate_drawer_metadata(record.metadata, schema)
+                    metadata = dict(record.metadata)
+                    metadata["ingest_mode"] = validate_drawer_ingest_mode(metadata, adapter)
+                    validate_drawer_metadata(metadata, schema)
                     state = state_for(record.source_file)
                     if state["skip"] or state["tombstone"]:
                         return
@@ -878,7 +890,7 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                     validate_route_hint(effective_route)
                     state["reconcile"] = True  # eager adapters have no item metadata
                     staged_by_source.setdefault(record.source_file, []).append(
-                        replace(record, route_hint=effective_route)
+                        replace(record, metadata=metadata, route_hint=effective_route)
                     )
 
                 for result in adapter.ingest(source=source, palace=context):
@@ -930,20 +942,53 @@ def mine_source_adapter(  # noqa: C901 - staged protocol validation is intention
                     state["reconcile"] = True
 
                 # After all protocol, schema, and route checks have succeeded,
-                # stale source drawers can be replaced or removed.
+                # write a fresh candidate generation *before* retiring the old
+                # one. A failing durable write cannot delete a prior good
+                # source item; stale IDs are removed only after every candidate
+                # is stored successfully.
                 context.staging = False
                 context.default_route_hint = default_route
-                for source_file, state in states.items():
-                    if state["reconcile"]:
-                        context.delete_source_item(source_file)
+                previous_ids = {
+                    source_file: context.source_item_ids(source_file)
+                    for source_file, state in states.items()
+                    if state["reconcile"] and not state["skip"] and not state["tombstone"]
+                }
                 drawers_written = 0
-                for source_file, records in staged_by_source.items():
-                    state = states[source_file]
-                    if state["skip"] or state["tombstone"]:
-                        continue
-                    for record in records:
-                        context.upsert_drawer(record)
-                        drawers_written += 1
+                candidate_ids: list[str] = []
+                try:
+                    for source_file, records in staged_by_source.items():
+                        state = states[source_file]
+                        if state["skip"] or state["tombstone"]:
+                            continue
+                        # Existing rows require a distinct candidate generation;
+                        # stable IDs remain unchanged for first ingest.
+                        suffix = f"_{uuid4().hex}" if previous_ids.get(source_file) else ""
+                        for record in records:
+                            candidate_ids.append(context._drawer_id_for(record, id_suffix=suffix))
+                            context._upsert_drawer(record, id_suffix=suffix)
+                            drawers_written += 1
+                except Exception:
+                    # The old generation is still untouched. Best-effort cleanup
+                    # of already durable candidates avoids exposing an incomplete
+                    # replacement; never mask the original write failure.
+                    if candidate_ids:
+                        try:
+                            context._storage_collection.delete(ids=candidate_ids)
+                        except Exception:
+                            logging.getLogger(__name__).exception(
+                                "could not roll back staged source-adapter candidates"
+                            )
+                    raise
+                # Candidate writes completed, so now retire only the exact old
+                # IDs captured before writing. Tombstones intentionally have
+                # no replacement and retain their scoped delete semantics.
+                for source_file, state in states.items():
+                    if state["tombstone"]:
+                        context.delete_source_item(source_file)
+                    elif state["reconcile"]:
+                        ids = previous_ids.get(source_file, [])
+                        if ids:
+                            context._storage_collection.delete(ids=ids)
                 return drawers_written
             finally:
                 if not dry_run:

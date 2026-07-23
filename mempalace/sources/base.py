@@ -340,6 +340,51 @@ UNIVERSAL_METADATA_FIELDS = frozenset(
     }
 )
 
+SUPPORTED_INGEST_MODES = frozenset({"chunked_content", "whole_record", "metadata_only"})
+
+
+def validate_adapter_contract(adapter: "BaseSourceAdapter") -> None:
+    """Validate the executable RFC 002 mode/transformation declaration.
+
+    These attributes are class-level compatibility promises, not advisory
+    documentation: core must reject malformed declarations before it calls
+    third-party ``ingest`` code. Custom transformation names remain allowed,
+    but their container and individual names must be deterministic and usable.
+    """
+    modes = getattr(adapter, "supported_modes", None)
+    if not isinstance(modes, frozenset) or not modes or not modes <= SUPPORTED_INGEST_MODES:
+        raise SourceAdapterProtocolError(
+            "supported_modes must be a non-empty frozenset subset of: "
+            + ", ".join(sorted(SUPPORTED_INGEST_MODES))
+        )
+    transforms = getattr(adapter, "declared_transformations", None)
+    if not isinstance(transforms, frozenset) or any(
+        not isinstance(name, str) or not name for name in transforms
+    ):
+        raise SourceAdapterProtocolError(
+            "declared_transformations must be a frozenset of non-empty strings"
+        )
+
+
+def validate_drawer_ingest_mode(metadata: dict, adapter: "BaseSourceAdapter") -> str:
+    """Require a record's declared mode to be supported by its adapter.
+
+    Single-mode adapters may omit the redundant field; core records their sole
+    supported mode. Multi-mode adapters must name the mode per drawer.
+    """
+    mode = metadata.get("ingest_mode")
+    if mode is None:
+        if len(adapter.supported_modes) == 1:
+            return next(iter(adapter.supported_modes))
+        raise SourceAdapterProtocolError(
+            "DrawerRecord.metadata['ingest_mode'] is required for multi-mode adapters"
+        )
+    if mode not in adapter.supported_modes:
+        raise SourceAdapterProtocolError(
+            f"DrawerRecord.metadata['ingest_mode'] {mode!r} is not declared in supported_modes"
+        )
+    return mode
+
 
 def validate_adapter_schema(schema: AdapterSchema) -> None:
     """Validate the portion of an RFC 002 schema core relies on at runtime.

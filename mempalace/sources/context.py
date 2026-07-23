@@ -17,7 +17,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional, Protocol
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 from .base import (
     DrawerRecord,
@@ -46,6 +47,58 @@ class _CollectionLike(Protocol):
 
 class _KnowledgeGraphLike(Protocol):
     def add_triple(self, subject: str, predicate: str, obj: str, **kwargs: Any) -> Any: ...
+
+
+def _freeze_config_value(value: Any) -> Any:
+    """Make the small, adapter-safe config projection immutable."""
+    if isinstance(value, dict):
+        return MappingProxyType({str(key): _freeze_config_value(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_config_value(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True)
+class AdapterConfig:
+    """Explicit non-secret config surface available to source adapters.
+
+    Passing ``MempalaceConfig`` through the plugin boundary exposes private
+    file contents and backend credentials. Adapters only receive routing data
+    and the already-enforced privacy policy as immutable snapshots.
+    """
+
+    hall_keywords: Mapping[str, Any]
+    topic_wings: tuple[Any, ...]
+    privacy_floor: str | None
+
+    @classmethod
+    def from_config(cls, config: Any) -> "AdapterConfig":
+        return cls(
+            hall_keywords=_freeze_config_value(getattr(config, "hall_keywords", {})),
+            topic_wings=_freeze_config_value(getattr(config, "topic_wings", ())),
+            privacy_floor=getattr(config, "privacy_floor", None),
+        )
+
+
+class ReadOnlyKnowledgeGraph:
+    """Deliberately capability-poor KG surface for third-party adapters.
+
+    RFC 002 dispatch does not give plugins a live KG/backend handle. The
+    mutating KG API is intentionally absent; callers can use the stable read
+    summary only. This prevents a plugin from committing a graph transaction
+    while its drawer output is still staged.
+    """
+
+    __slots__ = ("_stats",)
+
+    def __init__(self, knowledge_graph: Any):
+        stats = getattr(knowledge_graph, "stats", None)
+        value = stats() if callable(stats) else {}
+        self._stats = MappingProxyType(dict(value)) if isinstance(value, dict) else MappingProxyType({})
+
+    def stats(self) -> dict:
+        """Return a detached graph summary when the backend supports it."""
+        return dict(self._stats)
 
 
 # Progress hook signature: ``fn(event_name, **details) -> None``.
@@ -141,6 +194,11 @@ class PalaceContext:
     # ------------------------------------------------------------------
 
     def upsert_drawer(self, record: DrawerRecord) -> None:
+        """Persist an adapter drawer using its stable, public ID shape."""
+        self._upsert_drawer(record)
+
+    def _upsert_drawer(self, record: DrawerRecord, *, id_suffix: str = "") -> None:
+        """Core-only drawer persistence with an optional candidate ID suffix."""
         """Persist a ``DrawerRecord`` to the drawer collection.
 
         Applies the spec-mandated ``adapter_name`` and ``adapter_version``
@@ -185,7 +243,9 @@ class PalaceContext:
         meta["wing"] = route.wing or "default"
         meta["room"] = route.room or "general"
         meta["hall"] = route.hall or "general"
-        drawer_id = _build_drawer_id(record, adapter_name=self.adapter_name)
+        drawer_id = _build_drawer_id(
+            record, adapter_name=self.adapter_name, id_suffix=id_suffix
+        )
         validate_route_hint(self.default_route_hint)
         validate_route_hint(record.route_hint)
         validate_route_hint(route)
@@ -219,6 +279,26 @@ class PalaceContext:
             self._staged_deletes.add(source_file)
         elif not self.dry_run:
             self._storage_collection.delete(where=self._source_item_where(source_file))
+
+    def source_item_ids(self, source_file: str) -> list[str]:
+        """Return the exact durable IDs for this adapter-scoped source item.
+
+        Replacement uses these IDs only after all candidate drawers have been
+        durably written. Never delete by a broad source filter after candidate
+        writes: that could erase the just-written generation too.
+        """
+        result = self._storage_collection.get(
+            where=self._source_item_where(source_file), include=[]
+        )
+        if not isinstance(result, dict):
+            return []
+        return [value for value in (result.get("ids") or []) if isinstance(value, str)]
+
+    def _drawer_id_for(self, record: DrawerRecord, *, id_suffix: str = "") -> str:
+        """Core-only deterministic ID calculation for rollback bookkeeping."""
+        return _build_drawer_id(
+            record, adapter_name=self.adapter_name, id_suffix=id_suffix
+        )
 
     def replace_source_item(self, source_file: str) -> None:
         """Clear a stale source item before writing its replacement drawers."""
@@ -262,7 +342,9 @@ class PalaceContext:
                 logging.getLogger(__name__).exception("progress hook failed on %r", event)
 
 
-def _build_drawer_id(record: DrawerRecord, *, adapter_name: str = "") -> str:
+def _build_drawer_id(
+    record: DrawerRecord, *, adapter_name: str = "", id_suffix: str = ""
+) -> str:
     """Deterministic drawer id: ``<sha256(adapter + source_file)[:24]>_<chunk_index>``.
 
     Matches the shape existing miners rely on (``source_file`` + chunk index
@@ -281,7 +363,7 @@ def _build_drawer_id(record: DrawerRecord, *, adapter_name: str = "") -> str:
         # separator makes ("ab", "c") distinct from ("a", "bc").
         identity = f"{adapter_name}\0{record.source_file}"
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-    return f"{digest}_{record.chunk_index}"
+    return f"{digest}_{record.chunk_index}{id_suffix}"
 
 
 def _merge_route_hints(default: Optional[RouteHint], record: Optional[RouteHint]) -> RouteHint:
